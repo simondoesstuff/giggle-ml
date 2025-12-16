@@ -28,7 +28,7 @@ class RmeFMCache:
         zarr_path = self.embeds_dir / f"{bed_name}.zarr"
         z_array = zarr.open_array(zarr_path, mode="r")
         # full in-memory cache
-        return torch.from_numpy(z_array[:])
+        return torch.from_numpy(z_array[:].copy())
 
     @as_list
     def map(self, items: Iterable[tuple[int, Tensor]]) -> Iterator[Tensor]:
@@ -51,6 +51,15 @@ class RmeBedCache:
 
     @staticmethod
     def clean_intervals(intervals: list[tuple[str, int, int]]) -> Tensor:
+        special_chrms = {
+            "x": 23,
+            "y": 24,
+            "xy": 25,  # PAR
+            "par": 25,
+            "m": 26,
+            "mt": 26,
+        }
+
         def _chrm_id(chrm):
             if not chrm.startswith("chr"):
                 raise ValueError(f"Unknown chromosome {chrm}")
@@ -59,17 +68,8 @@ class RmeBedCache:
 
             id = chrm[3:].lower()
 
-            mapping = {
-                "x": 23,
-                "y": 24,
-                "xy": 25,  # PAR
-                "par": 25,
-                "m": 26,
-                "mt": 26,
-            }
-
-            if id in mapping:
-                return mapping[id] - 1
+            if (special := special_chrms.get(id, None)) is not None:
+                return special
             return int(id) - 1
 
         clean_intervals = [
