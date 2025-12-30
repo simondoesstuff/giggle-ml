@@ -3,7 +3,7 @@ import torch
 from pathlib import Path
 
 from giggleml.data_wrangling import fasta
-from giggleml.data_wrangling.interval_dataset import BedDataset
+from giggleml.data_wrangling.interval_dataset import BedDataset, MemoryIntervalDataset
 from giggleml.data_wrangling.list_dataset import ListDataset
 from giggleml.data_wrangling.unified_dataset import UnifiedDataset
 
@@ -119,3 +119,82 @@ def test_to_gpu_serializable_with_path():
     assert len(chr_to_idx_str) > 0  # Should have chromosomes
     assert len(offsets_str) == len(sizes_str)  # Should be aligned
     assert len(offsets_str) == len(chr_to_idx_str)  # One per chromosome
+
+
+def test_bed_dataset_with_extra_columns():
+    """Test BED dataset parsing with additional columns (like gene names)"""
+    # Create test BED data with gene names in column 4
+    test_bed_content = """chr1\t1000\t2000\tGENE1
+chr2\t3000\t4000\tGENE2
+chr3\t5000\t6000\tGENE3\textra_info
+chrX\t7000\t8000\tGENEX"""
+    
+    # Write test file
+    test_bed_path = Path("tests/test_with_genes.bed")
+    test_bed_path.write_text(test_bed_content)
+    
+    try:
+        # Test BedDataset
+        bed = BedDataset(test_bed_path)
+        assert len(bed) == 4
+        
+        # Test backward compatibility - standard iteration should still work
+        intervals = list(bed)
+        assert intervals[0] == ("chr1", 1000, 2000)
+        assert intervals[1] == ("chr2", 3000, 4000)
+        assert intervals[2] == ("chr3", 5000, 6000)
+        assert intervals[3] == ("chrX", 7000, 8000)
+        
+        # Test new functionality - iteration with extra columns
+        intervals_with_extras = list(bed.iter_with_extra_columns())
+        assert len(intervals_with_extras) == 4
+        
+        interval1, extras1 = intervals_with_extras[0]
+        assert interval1 == ("chr1", 1000, 2000)
+        assert extras1 == ["GENE1"]
+        
+        interval2, extras2 = intervals_with_extras[1]
+        assert interval2 == ("chr2", 3000, 4000)
+        assert extras2 == ["GENE2"]
+        
+        interval3, extras3 = intervals_with_extras[2]
+        assert interval3 == ("chr3", 5000, 6000)
+        assert extras3 == ["GENE3", "extra_info"]  # Multiple extra columns
+        
+        interval4, extras4 = intervals_with_extras[3]
+        assert interval4 == ("chrX", 7000, 8000)
+        assert extras4 == ["GENEX"]
+        
+    finally:
+        # Clean up test file
+        if test_bed_path.exists():
+            test_bed_path.unlink()
+
+
+def test_memory_interval_dataset_with_extra_columns():
+    """Test MemoryIntervalDataset with extra columns functionality"""
+    intervals = [("chr1", 100, 200), ("chr2", 300, 400)]
+    extra_columns = [["GENE_A"], ["GENE_B", "annotation"]]
+    
+    dataset = MemoryIntervalDataset(intervals, extra_columns=extra_columns)
+    
+    # Test backward compatibility
+    assert len(dataset) == 2
+    assert dataset[0] == ("chr1", 100, 200)
+    assert dataset[1] == ("chr2", 300, 400)
+    
+    # Test standard iteration
+    intervals_iter = list(dataset)
+    assert intervals_iter == [("chr1", 100, 200), ("chr2", 300, 400)]
+    
+    # Test iteration with extra columns
+    with_extras = list(dataset.iter_with_extra_columns())
+    assert len(with_extras) == 2
+    
+    interval1, extras1 = with_extras[0]
+    assert interval1 == ("chr1", 100, 200)
+    assert extras1 == ["GENE_A"]
+    
+    interval2, extras2 = with_extras[1]
+    assert interval2 == ("chr2", 300, 400)
+    assert extras2 == ["GENE_B", "annotation"]

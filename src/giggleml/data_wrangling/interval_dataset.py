@@ -34,22 +34,27 @@ class LateIntervalDataset(KindDataset[GenomicInterval]):
 
     def __init__(
         self,
-        lazy_getter: Callable[[], list[GenomicInterval]],
+        lazy_getter: Callable[[], list[GenomicInterval] | tuple[list[GenomicInterval], list[list[str]]]],
         lazy_length: Callable[[], int] | int | None,
         associated_fasta_path: PathLike | None,
     ):
-        self.lazy_getter: Callable[[], list[GenomicInterval]] = lazy_getter
+        self.lazy_getter: Callable[[], list[GenomicInterval] | tuple[list[GenomicInterval], list[list[str]]]] = lazy_getter
         self.lazy_length: Callable[[], int] | int | None = lazy_length
         self.associated_fasta_path: Path | None = as_path(associated_fasta_path)
 
     @cached_property
-    def _content(self):
-        return self.lazy_getter()
+    def _full_content(self):
+        result = self.lazy_getter()
+        if isinstance(result, tuple) and len(result) == 2:
+            return result  # Return (intervals, extra_columns)
+        # For backward compatibility, if no extra columns, return empty lists
+        return result, [[] for _ in range(len(result))]
 
     @cached_property
     def _length(self):
         if self.lazy_length is None:
-            return len(self._content)
+            intervals, _ = self._full_content
+            return len(intervals)
         elif isinstance(self.lazy_length, int):
             return self.lazy_length
         else:
@@ -61,7 +66,17 @@ class LateIntervalDataset(KindDataset[GenomicInterval]):
 
     @override
     def __getitem__(self, idx: int):
-        return self._content[idx]
+        intervals, _ = self._full_content
+        return intervals[idx]
+
+    def iter_with_extra_columns(self) -> Iterator[tuple[GenomicInterval, list[str]]]:
+        """Iterate over intervals with their additional columns."""
+        intervals, extra_columns = self._full_content
+        return iter(zip(intervals, extra_columns))
+    
+    @override
+    def __iter__(self) -> Iterator[GenomicInterval]:
+        return (interval for interval, _ in self.iter_with_extra_columns())
 
 
 @final
@@ -70,10 +85,12 @@ class MemoryIntervalDataset(KindDataset[GenomicInterval]):
         self,
         intervals: Sequence[GenomicInterval],
         associated_fasta_path: PathLike | None = None,
+        extra_columns: Sequence[list[str]] | None = None,
     ):
         super().__init__()
         self.intervals = intervals
         self.associated_fasta_path = as_path(associated_fasta_path)
+        self.extra_columns = extra_columns or [[] for _ in range(len(intervals))]
 
     @override
     def __len__(self):
@@ -82,6 +99,14 @@ class MemoryIntervalDataset(KindDataset[GenomicInterval]):
     @override
     def __getitem__(self, idx: int) -> GenomicInterval:
         return self.intervals[idx]
+
+    def iter_with_extra_columns(self) -> Iterator[tuple[GenomicInterval, list[str]]]:
+        """Iterate over intervals with their additional columns."""
+        return iter(zip(self.intervals, self.extra_columns))
+    
+    @override
+    def __iter__(self) -> Iterator[GenomicInterval]:
+        return (interval for interval, _ in self.iter_with_extra_columns())
 
 
 @lazy
@@ -113,6 +138,7 @@ class BedDataset(LateIntervalDataset):
 
         def parse(file):
             intervals = list[GenomicInterval]()
+            extra_columns = list[list[str]]()
 
             for line in file:
                 if not self.shuffle and len(intervals) >= self.limit:
@@ -121,17 +147,27 @@ class BedDataset(LateIntervalDataset):
                 if line.startswith("#"):
                     continue
 
-                name, start, stop = line.split("\t")[:3]
+                parts = line.strip().split("\t")
+                name, start, stop = parts[:3]
                 intervals.append((name, int(start), int(stop)))
+                
+                # Store any additional columns beyond the first 3
+                extra_columns.append(parts[3:] if len(parts) > 3 else [])
 
             if self.shuffle:
-                random.shuffle(intervals)
+                # Shuffle both lists together
+                combined = list(zip(intervals, extra_columns))
+                random.shuffle(combined)
+                intervals, extra_columns = zip(*combined) if combined else ([], [])
+                intervals = list(intervals)
+                extra_columns = list(extra_columns)
 
                 if self.limit != float("inf"):
                     # when shuffling, we apply the limit after a full read
                     intervals = intervals[: self.limit]
+                    extra_columns = extra_columns[: self.limit]
 
-            return intervals
+            return intervals, extra_columns
 
         if self.path.suffixes[-2:] == [".bed", ".gz"]:
             with gzip.open(self.path, "rt") as file:  # 'rt' mode for text reading
