@@ -10,6 +10,7 @@ from torch import Tensor
 
 import giggleml.utils.roadmap_epigenomics as rme
 from giggleml.data_wrangling.interval_dataset import BedDataset
+from giggleml.utils.interval_arithmetic import intervals_to_tensor
 from giggleml.utils.path_utils import fix_bed_ext
 from giggleml.utils.utils.collection_utils import as_list
 
@@ -49,34 +50,6 @@ class RmeBedCache:
     def __init__(self, rme_dir: PathLike) -> None:
         self.rme_dir = Path(rme_dir)
 
-    @staticmethod
-    def clean_intervals(intervals: list[tuple[str, int, int]]) -> Tensor:
-        special_chrms = {
-            "x": 23,
-            "y": 24,
-            "xy": 25,  # PAR
-            "par": 25,
-            "m": 26,
-            "mt": 26,
-        }
-
-        def _chrm_id(chrm):
-            if not chrm.startswith("chr"):
-                raise ValueError(f"Unknown chromosome {chrm}")
-
-            # FIXME: this is basically tokenization and should be moved into the model's tokenizer
-
-            id = chrm[3:].lower()
-
-            if (special := special_chrms.get(id, None)) is not None:
-                return special
-            return int(id) - 1
-
-        clean_intervals = [
-            (_chrm_id(chrm), start, end) for (chrm, start, end) in intervals
-        ]
-        return torch.tensor(clean_intervals, dtype=torch.long, pin_memory=True)
-
     @cache
     def get_tensor(self, bed_name: str) -> Tensor:
         """
@@ -85,7 +58,8 @@ class RmeBedCache:
         """
         path = fix_bed_ext(self.rme_dir / bed_name)
         bed = list(iter(BedDataset(path)))
-        return RmeBedCache.clean_intervals(bed)
+        # FIXME: this is basically tokenization and should be moved into the model's tokenizer
+        return intervals_to_tensor(bed, torch.long, pin_memory=True)  # FIXME: why long?
 
     @as_list
     def map(self, items: Iterable[tuple[int, Tensor]]) -> Iterator[Tensor]:

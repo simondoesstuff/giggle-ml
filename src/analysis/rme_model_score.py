@@ -10,10 +10,10 @@ from tqdm import tqdm
 
 import giggleml.utils.roadmap_epigenomics as rme
 from giggleml.data_wrangling.interval_dataset import BedDataset
+from giggleml.data_wrangling.rme_caches import RmeBedCache, RmeFMCache
 from giggleml.embed_gen.batch_infer import GenomicEmbedder
 from giggleml.models.c_model import CModel
 from giggleml.models.hyena_dna import HyenaDNA
-from giggleml.train.rme_caches import RmeBedCache, RmeFMCache
 from giggleml.utils.parallel import dist_process_group
 from giggleml.utils.torch_utils import get_rank, guess_device, launch_fabric
 

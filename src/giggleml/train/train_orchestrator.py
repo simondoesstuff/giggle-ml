@@ -17,9 +17,9 @@ from torch import Tensor, optim
 from torch.nn.modules.loss import TripletMarginLoss
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+from giggleml.data_wrangling.rme_caches import RmeBedCache, RmeFMCache
 from giggleml.models.c_model import CModel
 from giggleml.train.graph_triplet_miner import GraphTripletMiner
-from giggleml.train.rme_caches import RmeBedCache, RmeFMCache
 from giggleml.train.rme_clusters_dataset import MiningBatch, RmeSeqpareClusters
 from giggleml.train.seqpare_db import SeqpareDB
 from giggleml.utils.cv_splits import create_cv_splits

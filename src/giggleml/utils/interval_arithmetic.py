@@ -1,3 +1,7 @@
+from collections.abc import Iterable
+
+import torch
+
 from giggleml.utils.types import GenomicInterval
 
 
@@ -24,3 +28,31 @@ def overlap_degree(x: GenomicInterval, y: GenomicInterval) -> int:
         return 0
 
     return overlap[2] - overlap[1]
+
+
+def intervals_to_tensor(
+    intervals: Iterable[GenomicInterval],
+    dtype: torch.dtype = torch.int32,
+    pin_memory: bool = True,
+) -> torch.Tensor:
+    special_chrms = {
+        "x": 23,
+        "y": 24,
+        "xy": 25,  # PAR
+        "par": 25,
+        "m": 26,
+        "mt": 26,
+    }
+
+    def _chrm_id(chrm):
+        if not chrm.startswith("chr"):
+            raise ValueError(f"Unknown chromosome {chrm}")
+
+        id = chrm[3:].lower()
+
+        if (special := special_chrms.get(id, None)) is not None:
+            return special
+        return int(id) - 1
+
+    clean_intervals = [(_chrm_id(chrm), start, end) for (chrm, start, end) in intervals]
+    return torch.tensor(clean_intervals, dtype=dtype, pin_memory=pin_memory)
