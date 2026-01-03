@@ -21,6 +21,10 @@ class IntervalDataset(Protocol):
 
     def __iter__(self) -> Iterator[GenomicInterval]: ...
 
+    def iter_with_extra_columns(
+        self,
+    ) -> Iterator[tuple[GenomicInterval, list[str]]]: ...
+
 
 @lazy
 class LateIntervalDataset(KindDataset[GenomicInterval]):
@@ -34,11 +38,15 @@ class LateIntervalDataset(KindDataset[GenomicInterval]):
 
     def __init__(
         self,
-        lazy_getter: Callable[[], list[GenomicInterval] | tuple[list[GenomicInterval], list[list[str]]]],
+        lazy_getter: Callable[
+            [], list[GenomicInterval] | tuple[list[GenomicInterval], list[list[str]]]
+        ],
         lazy_length: Callable[[], int] | int | None,
         associated_fasta_path: PathLike | None,
     ):
-        self.lazy_getter: Callable[[], list[GenomicInterval] | tuple[list[GenomicInterval], list[list[str]]]] = lazy_getter
+        self.lazy_getter: Callable[
+            [], list[GenomicInterval] | tuple[list[GenomicInterval], list[list[str]]]
+        ] = lazy_getter
         self.lazy_length: Callable[[], int] | int | None = lazy_length
         self.associated_fasta_path: Path | None = as_path(associated_fasta_path)
 
@@ -73,7 +81,7 @@ class LateIntervalDataset(KindDataset[GenomicInterval]):
         """Iterate over intervals with their additional columns."""
         intervals, extra_columns = self._full_content
         return iter(zip(intervals, extra_columns))
-    
+
     @override
     def __iter__(self) -> Iterator[GenomicInterval]:
         return (interval for interval, _ in self.iter_with_extra_columns())
@@ -103,7 +111,7 @@ class MemoryIntervalDataset(KindDataset[GenomicInterval]):
     def iter_with_extra_columns(self) -> Iterator[tuple[GenomicInterval, list[str]]]:
         """Iterate over intervals with their additional columns."""
         return iter(zip(self.intervals, self.extra_columns))
-    
+
     @override
     def __iter__(self) -> Iterator[GenomicInterval]:
         return (interval for interval, _ in self.iter_with_extra_columns())
@@ -150,7 +158,7 @@ class BedDataset(LateIntervalDataset):
                 parts = line.strip().split("\t")
                 name, start, stop = parts[:3]
                 intervals.append((name, int(start), int(stop)))
-                
+
                 # Store any additional columns beyond the first 3
                 extra_columns.append(parts[3:] if len(parts) > 3 else [])
 
