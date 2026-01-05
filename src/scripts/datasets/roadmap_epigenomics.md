@@ -17,15 +17,26 @@ python $scripts/rme_split.py "*.bed.gz" ./
 parallel --plus "bedtools sort -i {} > {.}.tmp && mv {.}.tmp {} && echo {}" ::: *.bed
 ls *.bed | parallel -I {} sh -c "bedtools sort -i {} > {}_ && mv {}_ {} && echo {}"
 
+# remove bad intervals
+#   1. get blacklist, known bad intervals
+wget https://github.com/Boyle-Lab/Blacklist/raw/refs/heads/master/lists/hg38-blacklist.v2.bed.gz
+gunzip hg38-blacklist.v2.bed.gz
+#   2. apply blacklist & remove intervals sized <= 200
+ls *.bed | parallel --bar "bedtools intersect -v -a {} -b hg38-blacklist.v2.bed | \
+awk '(\$3-\$2) >= 190' > {.}.tmp \
+&& mv {.}.tmp {}"
+
 # optional:  bgzip outputs
 parallel --plus "bgzip {} && echo {}" ::: *.bed
 
 # clean up
 rm raw.tgz
 rm *_mnemonics.bed.gz
+rm hg38-blacklist.v2.bed
 
 # check
 ls | wc -l  # 1905
+wc -l * | tail -n 1  # 55845434 total
 ```
 
 **For hg19** compatible, avoid the liftover:
