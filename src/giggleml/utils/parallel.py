@@ -93,10 +93,13 @@ def dist_process_group(
 
     try:
         device: torch.device = guess_device(rank)
-        dev_id = device.index
+        dev_id = device.index if not isinstance(device, int) else None
 
         dist.init_process_group(
-            backend=backend, rank=rank, world_size=world_size, device_id=dev_id
+            backend=backend,
+            rank=rank,
+            world_size=world_size,
+            device_id=dev_id,  # don't specify on old torch versions (fiji) due to weird errors
         )
 
         if backend == "nccl":
