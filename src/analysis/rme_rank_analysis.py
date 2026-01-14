@@ -8,6 +8,7 @@ import seaborn as sns
 from scipy.stats import kendalltau
 
 import giggleml.utils.roadmap_epigenomics as rme
+from analysis.adv_heatmap import plot_heatmap_with_averages
 
 
 def parse_scores_tsv(
@@ -159,26 +160,100 @@ def kendall_tau_matrix(sources: Iterable[tuple[str, list[int]]]):
     return fig
 
 
-def rme_heatmap(scores: list[float]): ...
+def rme_heatmap(scores: list[float], title: str = "RME Similarity"):
+    """
+    Generates a heatmap of scores organized by cell type (rows) and chromatin state (columns).
+
+    The rows are grouped by cell category (Tissue, Primary Culture, etc.).
+    """
+
+    # 1. Initialize the data matrix (Cell Types x Chromatin States)
+    # We fill it with NaNs initially to handle missing combinations gracefully
+    n_cell_types = len(rme.cell_types)
+    n_states = len(rme.chromatin_states)
+    matrix = np.full((n_cell_types, n_states), np.nan)
+
+    # 2. Map the flat scores list into the matrix
+    # We iterate through the scores and their corresponding bed names
+    for score, bed_name in zip(scores, rme.bed_names):
+        # Split the bed name into cell type and chromatin state
+        cell_type, chro_state = rme.cell_type_chrm_state_split(bed_name)
+
+        # Get the integer indices for the matrix
+        row_idx = rme.cell_type_id(cell_type)
+        col_idx = rme.chro_state_id(chro_state)
+
+        matrix[row_idx, col_idx] = score
+
+    # 3. Organize rows (Cell Types) by Category
+    # We need to sort or group the cell types so the heatmap has meaningful blocks
+
+    # Get all categories and sort them (optional, but good for consistency)
+    categories = sorted(list(rme.cell_category.keys()))
+
+    ordered_matrix_rows = []
+    y_label_groups = []
+
+    for category in categories:
+        # Get all cell types belonging to this category
+        # We need to sort them to ensure deterministic order within the group
+        cells_in_category = sorted(list(rme.cell_category[category]))
+
+        # If there are no cells in this category, skip
+        if not cells_in_category:
+            continue
+
+        group_size = 0
+
+        for cell_type in cells_in_category:
+            # Get the original index of this cell type
+            original_idx = rme.cell_type_id(cell_type)
+
+            # Append the data for this cell type to our re-ordered list
+            ordered_matrix_rows.append(matrix[original_idx, :])
+            group_size += 1
+
+        # Record the group label and its size for the plotter
+        y_label_groups.append((category, group_size))
+
+    # Stack the rows to create the final sorted matrix
+    if not ordered_matrix_rows:
+        # Handle edge case where no data exists
+        final_matrix = np.array([[]])
+    else:
+        final_matrix = np.vstack(ordered_matrix_rows)
+
+    # 4. Call the plotting function
+    fig, *axes = plot_heatmap_with_averages(
+        x_labels=rme.chromatin_states,  # Columns are chromatin states
+        y_label_groups=y_label_groups,  # Rows grouped by category
+        data_matrix=final_matrix,  # The re-ordered score data
+        title=title,
+        desired_tile_in=(0.3, 0.1),
+    )
+    fig.tight_layout()
+    return fig
 
 
 if __name__ == "__main__":
     root = Path("data/Rheumatoid_arthritis")
 
     giggle_scores = parse_scores_tsv(root / "giggle_scores.tsv", 0, 7, 2)
-    seqpare_scores = invert_scores(
-        parse_scores_tsv(root / "seqpare_scores.tsv", 5, 4, 1)
-    )
+    seqpare_scores = parse_scores_tsv(root / "seqpare_scores.tsv", 5, 4, 1)
     cmodel_scores = invert_scores(parse_scores_tsv(root / "cmodel_scores.tsv", 0, 1))
     fm_scores = invert_scores(parse_scores_tsv(root / "cmodel_scores.tsv", 0, 2))
 
-    giggle_ranks = scores_to_ranks(giggle_scores)
-    seqpare_ranks = scores_to_ranks(seqpare_scores)
-    cmodel_ranks = scores_to_ranks(cmodel_scores)
-    fm_ranks = scores_to_ranks(fm_scores)
-
     names = ["CModel", "HyenaDNA", "Seqpare", "Giggle"]
-    ranks = [cmodel_ranks, fm_ranks, seqpare_ranks, giggle_ranks]
+    scores = [cmodel_scores, fm_scores, seqpare_scores, giggle_scores]
+    ranks = [scores_to_ranks(x) for x in scores]
 
     fig = kendall_tau_matrix(zip(names, ranks))
     fig.savefig(Path("experiments/rheumatoid_arthritis/rme_kt_matrix.png"))
+
+    # heatmaps
+    for name, scores in zip(names, scores):
+        fig = rme_heatmap(scores, title=name)
+        suffix = name.lower()
+        fig.savefig(
+            Path(f"experiments/rheumatoid_arthritis/rme_sim_matrix-{suffix}.png")
+        )

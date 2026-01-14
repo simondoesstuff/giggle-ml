@@ -318,7 +318,7 @@ def plot_heatmap_with_averages(
             va="center",
             color="grey",
             fontsize="small",
-            transform=ax_grand_avg.trans_axes,
+            transform=ax_grand_avg.transAxes,
         )
     else:
         text_color = _get_text_color_for_background(cmap_obj(norm(grand_mean_val))[:3])
@@ -330,7 +330,7 @@ def plot_heatmap_with_averages(
             va="center",
             color=text_color,
             fontsize="small",
-            transform=ax_grand_avg.trans_axes,
+            transform=ax_grand_avg.transAxes,
         )
 
     # --- Colorbar ---
