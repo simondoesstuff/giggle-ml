@@ -4,6 +4,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     nixpkgs-old.url = "github:NixOS/nixpkgs/nixos-21.05";
     flake-utils.url = "github:numtide/flake-utils";
+    giggle.url = "path:/Users/simon/Code/lab/giggle-dev/giggle";
     seqpare-src = {
       url = "github:deepstanding/seqpare";
       flake = false;
@@ -16,6 +17,7 @@
       nixpkgs-old,
       flake-utils,
       seqpare-src,
+      giggle,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -54,8 +56,8 @@
             just
             bedtools
             # wget
-            # bedtools
             # samtools
+            giggle.packages.${system}.default
           ];
         };
       }
