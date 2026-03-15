@@ -57,6 +57,7 @@
             bedtools
             # wget
             # samtools
+            htslib # bgzip
             giggle.packages.${system}.default
           ];
         };
