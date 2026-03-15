@@ -9,8 +9,7 @@ __pycache__
 .env
 .DS_STORE
 
-./data
-.data
+/data
 # generated fastx indices
 *.fxi
 logs
