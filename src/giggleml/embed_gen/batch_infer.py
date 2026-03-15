@@ -218,7 +218,6 @@ class GenomicEmbedder:
         )
 
         def zarr_consumer(batch: list[tuple[int, Tensor | None]]) -> None:
-            nonlocal true_indices
             indices, embeddings = zip(*self._clean_batch(true_indices, batch))
 
             if len(indices) != 0:
