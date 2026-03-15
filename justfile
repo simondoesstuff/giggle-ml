@@ -1,4 +1,4 @@
-sync target:
+sync target='layerlab':
 	./sync {{target}}
 
 test:
