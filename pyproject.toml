@@ -10,6 +10,7 @@ dependencies = [
   "einx>=0.4.2",
   "equinox>=0.13.6",
   "filelock>=3.18.0",
+  "jaxtyping>=0.3.9",
   "matplotlib>=3.10.1",
   "numpy>=2.2.5",
   "pyfastx>=2.3.0",

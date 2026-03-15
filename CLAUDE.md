@@ -1,3 +1,4 @@
 - This is a uv project, so wrap related commands accordingly.
 - This project uses basedpyright and pytest.
+- This is a equinox and einx project, prefer them to standard torch code.
 - Always, feel free to ask questions!
