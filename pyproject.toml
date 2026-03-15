@@ -1,0 +1,50 @@
+[project]
+name = "GiggleML"
+description = "Giggle, based on embeddings"
+authors = [{ name = "Simon Walker", email = "simon@simonwalker.tech" }]
+readme = "README.md"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "accelerate>=1.6.0",
+  "einx>=0.4.2",
+  "equinox>=0.13.6",
+  "filelock>=3.18.0",
+  "matplotlib>=3.10.1",
+  "numpy>=2.2.5",
+  "pyfastx>=2.3.0",
+  "pytest>=8.3.5",
+  "scikit-learn>=1.6.1",
+  "scipy>=1.15.2",
+  "seaborn>=0.13.2",
+  "statistics>=1.0.3.5",
+  "tensorboard>=2.20.0",
+  "torch>=2.5.0",
+  "tqdm>=4.66.5",
+  "transformers>=4.51.3",
+  "umap-learn>=0.5.9.post2",
+  "zarr>=3.1.3",
+]
+
+[tool.black]
+line-length = 99
+
+[tool.pytest.ini_options]
+python_files = ["tests/test*.py"]
+pythonpath = ["src"]
+
+[tool.basedpyright]
+reportExplicitAny = false
+reportAny = false
+reportImplicitStringConcatenation = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnusedCallResult = false
+reportMissingTypeArgument = false
+# executionEnvironments = [
+# { root = "src" },
+# { root = "tests", extraPaths = ["src"] }
+# ]
+# include = [ "src", "tests" ]
+exclude = ["*.bed", "*.fxi", "data", "experiments", ".venv"]

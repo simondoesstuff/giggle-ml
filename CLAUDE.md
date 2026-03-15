@@ -1,0 +1,3 @@
+- This is a uv project, so wrap related commands accordingly.
+- This project uses basedpyright and pytest.
+- Always, feel free to ask questions!
