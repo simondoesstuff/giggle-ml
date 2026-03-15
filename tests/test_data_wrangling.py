@@ -3,6 +3,7 @@ import torch
 from pathlib import Path
 
 from giggleml.data_wrangling import fasta
+from giggleml.data_wrangling.gmt2regions import GeneMap, UpDownGMT2Regions
 from giggleml.data_wrangling.interval_dataset import BedDataset, MemoryIntervalDataset
 from giggleml.data_wrangling.list_dataset import ListDataset
 from giggleml.data_wrangling.unified_dataset import UnifiedDataset
@@ -198,3 +199,142 @@ def test_memory_interval_dataset_with_extra_columns():
     interval2, extras2 = with_extras[1]
     assert interval2 == ("chr2", 300, 400)
     assert extras2 == ["GENE_B", "annotation"]
+
+
+def test_gene_map():
+    """Test GeneMap class functionality"""
+    # Create test interval dataset with gene annotations
+    intervals = [
+        ("chr1", 1000, 2000),
+        ("chr1", 1500, 2500), 
+        ("chr2", 3000, 4000),
+        ("chr2", 3500, 4500),
+    ]
+    extra_columns = [
+        ["GENE1"],
+        ["GENE1"],  # Same gene, multiple intervals
+        ["GENE2"],
+        ["GENE3"],
+    ]
+    
+    interval_dataset = MemoryIntervalDataset(intervals, extra_columns=extra_columns)
+    
+    # Test GeneMap.build
+    gene_map = GeneMap.build(interval_dataset)
+    
+    # Check symbol table was created correctly
+    assert len(gene_map.symbol_table.base) == 3  # GENE1, GENE2, GENE3
+    assert set(gene_map.symbol_table.base) == {"GENE1", "GENE2", "GENE3"}
+    
+    # Test regions property
+    regions = gene_map.regions
+    assert len(regions) == 3  # One tensor per gene
+    
+    # Find which index corresponds to GENE1
+    gene1_idx = gene_map.symbol_table.index("GENE1")
+    gene1_regions = regions[gene1_idx]
+    
+    # GENE1 should have 2 intervals
+    assert gene1_regions.shape == (2, 3)
+    expected_gene1 = torch.tensor([[0, 1000, 2000], [0, 1500, 2500]], dtype=torch.int32)
+    assert torch.equal(gene1_regions, expected_gene1)
+
+
+def test_up_down_gmt2_regions():
+    """Test UpDownGMT2Regions class functionality"""
+    # Create test gene map
+    intervals = [
+        ("chr1", 1000, 2000),  # GENE1
+        ("chr1", 3000, 4000),  # GENE2  
+        ("chr2", 5000, 6000),  # GENE3
+    ]
+    extra_columns = [["GENE1"], ["GENE2"], ["GENE3"]]
+    interval_dataset = MemoryIntervalDataset(intervals, extra_columns=extra_columns)
+    gene_map = GeneMap.build(interval_dataset)
+    
+    # Create test GMT file
+    gmt_content = """pathway1 up GENE1 GENE2
+pathway1 down GENE3
+pathway2 up GENE2
+pathway2 down GENE1 GENE3"""
+    
+    test_gmt_path = Path("tests/test.gmt")
+    test_gmt_path.write_text(gmt_content)
+    
+    try:
+        # Test UpDownGMT2Regions
+        gmt_regions = UpDownGMT2Regions(test_gmt_path, gene_map)
+        
+        # Test gene_names method
+        pathway1_up_genes = gmt_regions.gene_names("pathway1", "up")
+        assert set(pathway1_up_genes) == {"GENE1", "GENE2"}
+        
+        pathway1_down_genes = gmt_regions.gene_names("pathway1", "down") 
+        assert pathway1_down_genes == ["GENE3"]
+        
+        pathway1_both_genes = gmt_regions.gene_names("pathway1", "both")
+        assert set(pathway1_both_genes) == {"GENE1", "GENE2", "GENE3"}
+        
+        # Test regions method
+        pathway1_up_regions = gmt_regions.regions("pathway1", "up")
+        assert pathway1_up_regions.shape == (2, 3)  # 2 genes, each with 1 interval
+        
+        pathway1_down_regions = gmt_regions.regions("pathway1", "down")
+        assert pathway1_down_regions.shape == (1, 3)  # 1 gene with 1 interval
+        
+        pathway1_both_regions = gmt_regions.regions("pathway1", "both")
+        assert pathway1_both_regions.shape == (3, 3)  # All 3 genes
+        
+        # Test pathway2
+        pathway2_up_regions = gmt_regions.regions("pathway2", "up")
+        assert pathway2_up_regions.shape == (1, 3)  # GENE2 only
+        
+        pathway2_down_regions = gmt_regions.regions("pathway2", "down")
+        assert pathway2_down_regions.shape == (2, 3)  # GENE1 and GENE3
+        
+    finally:
+        # Clean up test file
+        if test_gmt_path.exists():
+            test_gmt_path.unlink()
+
+
+def test_up_down_gmt2_regions_error_cases():
+    """Test error handling in UpDownGMT2Regions"""
+    # Create minimal gene map
+    intervals = [("chr1", 1000, 2000)]
+    extra_columns = [["GENE1"]]
+    interval_dataset = MemoryIntervalDataset(intervals, extra_columns=extra_columns)
+    gene_map = GeneMap.build(interval_dataset)
+    
+    # Test missing down entry
+    gmt_content_missing_down = "pathway1 up GENE1"
+    test_gmt_path = Path("tests/test_error.gmt")
+    test_gmt_path.write_text(gmt_content_missing_down)
+    
+    try:
+        gmt_regions = UpDownGMT2Regions(test_gmt_path, gene_map)
+        # This should raise an error when accessing _gene_ids
+        try:
+            _ = gmt_regions._gene_ids
+            assert False, "Expected ValueError for missing down entry"
+        except ValueError as e:
+            assert "Missing 'down' entry" in str(e)
+    finally:
+        if test_gmt_path.exists():
+            test_gmt_path.unlink()
+    
+    # Test gene not in map
+    gmt_content_unknown_gene = """pathway1 up UNKNOWN_GENE
+pathway1 down GENE1"""
+    test_gmt_path.write_text(gmt_content_unknown_gene)
+    
+    try:
+        gmt_regions = UpDownGMT2Regions(test_gmt_path, gene_map)
+        try:
+            _ = gmt_regions._gene_ids
+            assert False, "Expected ValueError for unknown gene"
+        except ValueError as e:
+            assert "not found in gene map" in str(e)
+    finally:
+        if test_gmt_path.exists():
+            test_gmt_path.unlink()
