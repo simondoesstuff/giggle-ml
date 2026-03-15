@@ -8,7 +8,7 @@ REMOTE_TARGET="${REMOTE_HOST}:${REMOTE_BASE_DIR}"
 # Directories/patterns to exclude from sync
 # Using an array for readability and easier modification
 declare -a EXCLUDE_PATTERNS=(
-	"data/"
+	"/data/"
 	"modelCkpts/"
 	"experiments/"
 	"jobOutput"
