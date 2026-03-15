@@ -1,16 +1,17 @@
 import os
 import shutil
+import socket
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import override
 
-from tqdm import tqdm
 import filelock
 import torch
 import torch.distributed as dist
 import zarr
 from torch import FloatTensor, nn
+from tqdm import tqdm
 
 from giggleml.data.fasta import fasta_map
 from giggleml.types import GenomicInterval
@@ -29,6 +30,37 @@ class NucleotideModel[T](nn.Module, ABC):
     @override
     @abstractmethod
     def forward(self, batch: T) -> FloatTensor: ...
+
+
+def _infer_port() -> int:
+    # Find a free port automatically
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def _infer_backend() -> str:
+    """Infer the optimal distributed backend based on available hardware.
+
+    Returns:
+        "nccl" for CUDA systems (best GPU communication performance)
+        "gloo" for MPS or CPU systems (universal compatibility)
+    """
+    if torch.cuda.is_available():
+        return "nccl"  # Best for CUDA GPUs
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "gloo"  # MPS doesn't support nccl
+    else:
+        return "gloo"  # CPU fallback
+
+
+def _infer_device(rank: int) -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{rank}")
+    elif torch.backends.mps.is_built():
+        return torch.device("mps")  # for mac use
+    else:
+        return torch.device("cpu")
 
 
 def embed_intervals[T](
@@ -53,14 +85,30 @@ def embed_intervals[T](
     """
     assert len(intervals) == len(out_paths)
 
-    # Distributed setup
-    if dist.is_initialized():
-        rank = dist.get_rank()
-        local_rank = int(os.environ.get("LOCAL_RANK", rank))
-        device = torch.device(f"cuda:{local_rank}")
+    # Distributed setup - only initialize if actually running in a distributed context
+    # (e.g., via torchrun), detected by WORLD_SIZE > 1 or RANK being set
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    in_distributed = world_size > 1 or "RANK" in os.environ
+
+    if in_distributed and dist.is_available():
+        rank = int(os.environ.get("LOCAL_RANK", 0))
+        os.environ["MASTER_PORT"] = str(os.environ.get("MASTER_PORT", _infer_port()))
+        os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+        backend = _infer_backend()
+        # device_id only works with NCCL backend (CUDA)
+        device_id = rank if backend == "nccl" else None
+        dist.init_process_group(
+            backend=backend,
+            rank=rank,
+            world_size=world_size,
+            device_id=device_id,
+        )
+        device = _infer_device(rank)
+        print(f"Using {world_size} devices: {device}")
     else:
         rank = 0
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = _infer_device(0)
+        print("Using 1 device:", device)
 
     model = model.to(device)
     model.eval()
@@ -76,7 +124,7 @@ def embed_intervals[T](
 
     # Work-stealing at set level: each process races to claim entire interval sets
     with torch.inference_mode():
-        for set_idx in tqdm(range(n_sets)):
+        for set_idx in tqdm(range(n_sets), disable=rank != 0):
             out_stem = Path(out_paths[set_idx]).stem
             done_path = lock_dir / f"{out_stem}.done"
 
