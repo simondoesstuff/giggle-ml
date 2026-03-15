@@ -28,5 +28,5 @@ def main(
 if __name__ == "__main__":
     batch_size = 76
     rme = Path("data/roadmap_epigenomics")
-    beds = list((rme / "beds").iterdir())[950:]
+    beds = list((rme / "beds").iterdir())
     main("16k", "data/hg/hg38.fa", beds, rme / "embeds", batch_size)
