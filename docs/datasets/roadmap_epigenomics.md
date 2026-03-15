@@ -11,11 +11,10 @@ tar -xzvf raw.tgz
 
 # split and rename
 #   127 cell types by 15 chromatin states gives us 1,905 files with 56,440,237 intervals.
-python src/scripts/rme_split.py "*.bed.gz" ./
+python ../../../src/scripts/rme_split.py "*.bed.gz" ./
 
 # sort with bedtools
-parallel --plus "bedtools sort -i {} > {.}.tmp && mv {.}.tmp {} && echo {}" ::: *.bed
-ls *.bed | parallel -I {} sh -c "bedtools sort -i {} > {}_ && mv {}_ {} && echo {}"
+parallel 'bedtools sort -i "{}" > "{.}.tmp" && mv "{.}.tmp" "{}" && echo "Sorted: {}"' ::: *.bed
 
 # remove bad intervals
 #   1. get blacklist, known bad intervals
@@ -36,7 +35,7 @@ rm hg38-blacklist.v2.bed
 
 # check
 ls | wc -l  # 1905
-wc -l * | tail -n 1  # 55845434 total
+wc -l * | tail -n 1  # 55889176 total
 ```
 
 **For hg19** compatible, avoid the liftover:
