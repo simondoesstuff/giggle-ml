@@ -1,5 +1,5 @@
 import gzip as gzip_module
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 
 import jax.numpy as jnp
 from jaxtyping import Array, Int
@@ -97,3 +97,30 @@ def load_bed_array(
         [chromosomes.index(iv[0]), iv[1], iv[2]] for iv in load_bed(path, gzip=gzip)
     ]
     return jnp.array(raw_intervals, dtype=jnp.int32)
+
+
+def crop_intervals(
+    intervals: Iterable[GenomicInterval],
+    size: int,
+    centers: Iterable[int] | None = None,
+) -> Iterator[GenomicInterval]:
+    """Crop genomic intervals to a fixed size.
+
+    Args:
+        intervals: Iterable of (chrom, start, end) tuples.
+        size: Target size in base pairs for each interval.
+        centers: Optional centers for cropping. If provided, crop symmetrically
+            around each center. If None, use interval start as anchor and take
+            `size` bp to the right.
+
+    Yields:
+        Cropped GenomicInterval tuples (chrom, start, end).
+    """
+    if centers is None:
+        for chrom, start, end in intervals:
+            yield chrom, start, min(start + size, end)
+    else:
+        half = size // 2
+        for (chrom, start, end), center in zip(intervals, centers):
+            new_start = max(center - half, start)
+            yield chrom, new_start, min(new_start + size, end)
