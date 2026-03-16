@@ -3,3 +3,4 @@
 - This is a equinox and einx project, prefer them to standard torch code.
 - Prefer justfile commands when available.
 - Always, feel free to ask questions!
+- With respect to repo/project root, tests are in /tests
