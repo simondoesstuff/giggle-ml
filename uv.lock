@@ -175,15 +175,11 @@ wheels = [
 [[package]]
 name = "einx"
 version = "0.4.2"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/simondoesstuff/einx.git#f0ab7938ff5b1349c675008135a88a9fcc2f8d4a" }
 dependencies = [
     { name = "frozendict" },
     { name = "numpy" },
     { name = "sympy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/36/b3/2b0acbde4f763b72f65da58cea54f35386f537569c4c39f3d37de1c03710/einx-0.4.2.tar.gz", hash = "sha256:9aeea7053a4f683235e81b62383069085cc919a012748c8575f3557455377e11", size = 114546, upload-time = "2026-03-14T07:39:06.6Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/97/7afa0d833cae4d8e651b8265b7c95613199d9749a4976149b5fd66052a06/einx-0.4.2-py3-none-any.whl", hash = "sha256:c3d01878ffe34f2e038a14b98f82b4b47bba32ee2f127618ab31851e439ba2f0", size = 139917, upload-time = "2026-03-14T07:39:05.413Z" },
 ]
 
 [[package]]
@@ -282,7 +278,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=1.6.0" },
-    { name = "einx", specifier = ">=0.4.2" },
+    { name = "einx", git = "https://github.com/simondoesstuff/einx.git" },
     { name = "equinox", specifier = ">=0.13.6" },
     { name = "filelock", specifier = ">=3.18.0" },
     { name = "jaxtyping", specifier = ">=0.3.9" },

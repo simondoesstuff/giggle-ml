@@ -99,11 +99,13 @@ class HyenaDNA(NucleotideModel[dict[str, Tensor]]):
         mask = mask.to(hidden.dtype)
 
         # Masked mean pooling
-        mask_expanded = cast(Tensor, einx.id("b s -> b s 1", mask))
+        mask_expanded = einx.id("b s -> b s 1", mask)
+        assert isinstance(mask_expanded, Tensor)
         weighted = hidden * mask_expanded
-        lengths: Tensor = einx.sum("b [s]", mask)
-        summed: Tensor = einx.sum("b [s] d", weighted)
-        lengths_expanded = cast(Tensor, einx.id("b -> b 1", lengths.clamp(min=1e-9)))
+        lengths = einx.sum("b [s]", mask)
+        summed = einx.sum("b [s] d", weighted)
+        lengths_expanded = einx.id("b -> b 1", lengths.clamp(min=1e-9))
+        assert isinstance(lengths_expanded, Tensor)
         pooled = summed / lengths_expanded
 
         return cast(FloatTensor, pooled.to(dtype=torch.float16))
