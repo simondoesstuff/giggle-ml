@@ -8,6 +8,7 @@ from transformers.models.auto.modeling_auto import AutoModel
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 
 from giggleml.inference.torch_inference import NucleotideModel
+from giggleml.utils.vram import VRAMCoeffs
 
 MODEL_CONFIGS: dict[str, tuple[int, str, int, str]] = {
     "1k": (1024, "LongSafari/hyenadna-tiny-1k-seqlen-hf", 128, "e8c1eff"),
@@ -16,6 +17,17 @@ MODEL_CONFIGS: dict[str, tuple[int, str, int, str]] = {
     "160k": (160000, "LongSafari/hyenadna-medium-160k-seqlen-hf", 256, "7ebf717"),
     "450k": (450000, "LongSafari/hyenadna-medium-450k-seqlen-hf", 256, "42dedd4"),
     "1m": (1_000_000, "LongSafari/hyenadna-large-1m-seqlen-hf", 256, "0a629ab"),
+}
+
+# VRAM coefficients for V(n, k) = a*n*k_fft + b*n + c where k_fft = next_pow2(2k-1)
+# Estimated via scripts/estimate_vram_coefficients.py (c set to 0, CI too wide)
+_VRAM_COEFFS: dict[str, VRAMCoeffs] = {
+    "1k": VRAMCoeffs(a=6546.0, b=348092.0, c=0.0),
+    "16k": VRAMCoeffs(a=6966.0, b=337772.0, c=0.0),
+    "32k": VRAMCoeffs(a=12393.0, b=749894.0, c=0.0),
+    "160k": VRAMCoeffs(a=13178.0, b=673388.0, c=0.0),
+    "450k": VRAMCoeffs(a=13723.0, b=483761.0, c=0.0),
+    "1m": VRAMCoeffs(a=14904.0, b=251045.0, c=0.0),
 }
 
 
@@ -114,6 +126,11 @@ class HyenaDNA(NucleotideModel[dict[str, Tensor]]):
         pooled = summed / lengths_expanded
 
         return cast(FloatTensor, pooled.to(dtype=torch.float16))
+
+    @property
+    def vram_coeffs(self) -> VRAMCoeffs:
+        """VRAM model coefficients for dynamic batching."""
+        return _VRAM_COEFFS[self._size]
 
     @override
     def __repr__(self) -> str:

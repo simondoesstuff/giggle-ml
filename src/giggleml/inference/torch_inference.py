@@ -18,6 +18,7 @@ from tqdm import tqdm
 from giggleml.data.fasta import fasta_map
 from giggleml.types import GenomicInterval
 from giggleml.utils.file_utils import Pathish
+from giggleml.utils.vram import VRAMCoeffs
 
 
 class NucleotideModel[T](nn.Module, ABC):
@@ -71,19 +72,25 @@ def embed_intervals[T](
     intervals: Sequence[Iterable[GenomicInterval]],
     out_paths: Sequence[Pathish],
     *,
-    batch_size: int = 256,
+    vram_coeffs: VRAMCoeffs,
+    vram_cap: float,
 ) -> None:
     """Embed interval sets across all GPUs using torchrun and save to Zarr v3.
 
     Uses file locks for work-stealing at the set level: processes race to claim
     entire interval sets, then process all batches within that set sequentially.
 
+    Batch sizes are dynamically computed using a VRAM model: intervals are
+    accumulated until adding another would exceed the estimated VRAM cap.
+    This minimizes padding waste when intervals are sorted by size.
+
     Args:
         model: The nucleotide embedding model.
         fasta: Dictionary mapping chromosome names to sequences.
         intervals: Sequence of interval sets to embed.
         out_paths: Output zarr array path for each interval set.
-        batch_size: Number of intervals to process per batch.
+        vram_coeffs: VRAM model coefficients (from estimate_vram_coefficients.py).
+        vram_cap: Target VRAM cap in bytes.
     """
     assert len(intervals) == len(out_paths)
 
@@ -176,27 +183,51 @@ def embed_intervals[T](
                     # Create output zarr array
                     out_path = Path(out_paths[set_idx])
                     out_path.parent.mkdir(parents=True, exist_ok=True)
+                    chunk_size = min(256, n_intervals)
                     arr = zarr.create_array(
                         out_path,
                         shape=(n_intervals, model.edim),
-                        chunks=(min(batch_size, n_intervals), model.edim),
+                        chunks=(chunk_size, model.edim),
                         dtype="float32",
                         overwrite=True,
                     )
 
-                    # Process all batches in this set
-                    for batch_start in range(0, n_intervals, batch_size):
-                        batch_end = min(batch_start + batch_size, n_intervals)
-                        batch_intervals = all_intervals[batch_start:batch_end]
+                    # Process batches with dynamic sizing based on VRAM model
+                    i = 0
+                    while i < n_intervals:
+                        batch_start = i
+                        batch_intervals: list[GenomicInterval] = []
+                        batch_max_len = 0
+
+                        # Accumulate intervals until adding another exceeds VRAM cap
+                        while i < n_intervals:
+                            interval = all_intervals[i]
+                            interval_size = interval[2] - interval[1]
+                            new_n = len(batch_intervals) + 1
+                            new_max_len = max(batch_max_len, interval_size)
+
+                            # Always include at least one interval per batch
+                            if batch_intervals:
+                                est_vram = vram_coeffs.estimate(new_n, new_max_len)
+                                if est_vram > vram_cap:
+                                    break
+
+                            batch_intervals.append(interval)
+                            batch_max_len = new_max_len
+                            i += 1
 
                         # intervals -> sequences -> embeddings
                         sequences = list(fasta_map(fasta, batch_intervals))
+                        batch_total = sum(len(s) for s in sequences)
+                        est_mb = vram_coeffs.estimate(len(sequences), batch_max_len) / (
+                            1024 * 1024
+                        )
                         batch_input = model.collate(sequences)
                         if hasattr(batch_input, "to"):
                             batch_input = batch_input.to(device)  # pyright: ignore[reportAttributeAccessIssue]
 
                         embeddings = model(batch_input)
-                        arr[batch_start:batch_end] = embeddings.cpu().numpy()
+                        arr[batch_start:i] = embeddings.cpu().numpy()
 
                     # Mark set as complete
                     done_path.touch()

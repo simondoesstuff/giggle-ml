@@ -99,6 +99,26 @@ def load_bed_array(
     return jnp.array(raw_intervals, dtype=jnp.int32)
 
 
+def sorted_by_size(
+    intervals: Sequence[GenomicInterval], descending: bool = False
+) -> Iterator[GenomicInterval]:
+    """Lazily yield intervals sorted by size (smallest first).
+
+    Takes a Sequence to signal that input must be materialized. Returns an
+    Iterator to signal single-use (not streaming). Sorting is deferred until
+    the first element is pulled.
+
+    Args:
+        intervals: Materialized sequence of (chrom, start, end) tuples.
+        descending: Sort descending
+
+    Yields:
+        GenomicInterval tuples sorted by (end - start) ascending.
+    """
+    sign = -1 if descending else 1
+    yield from sorted(intervals, key=lambda iv: sign * (iv[2] - iv[1]))
+
+
 def crop_intervals(
     intervals: Iterable[GenomicInterval],
     size: int,

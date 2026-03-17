@@ -9,6 +9,11 @@ import zarr
 from torch import FloatTensor, Tensor
 
 from giggleml.inference.torch_inference import NucleotideModel, embed_intervals
+from giggleml.utils.vram import VRAMCoeffs
+
+# Test VRAM coefficients: simple model where VRAM ~ 1000 * n * k_fft
+TEST_VRAM_COEFFS = VRAMCoeffs(a=1000.0, b=0.0, c=0.0)
+TEST_VRAM_CAP = 50_000.0  # ~50KB cap for testing
 
 
 class MockNucleotideModel(NucleotideModel[Tensor]):
@@ -76,7 +81,7 @@ class TestEmbedIntervals:
         intervals = [[("chr1", 0, 4), ("chr1", 4, 8)]]
         out_paths = [tmp_path / "out1.zarr"]
 
-        embed_intervals(model, fasta, intervals, out_paths, batch_size=2)
+        embed_intervals(model, fasta, intervals, out_paths, vram_coeffs=TEST_VRAM_COEFFS, vram_cap=TEST_VRAM_CAP)
 
         assert out_paths[0].exists()
 
@@ -86,7 +91,7 @@ class TestEmbedIntervals:
         intervals = [[("chr1", 0, 4), ("chr1", 4, 8), ("chr1", 0, 4)]]
         out_paths = [tmp_path / "out.zarr"]
 
-        embed_intervals(model, fasta, intervals, out_paths, batch_size=2)
+        embed_intervals(model, fasta, intervals, out_paths, vram_coeffs=TEST_VRAM_COEFFS, vram_cap=TEST_VRAM_CAP)
 
         arr = zarr.open(out_paths[0], mode="r")
         assert arr.shape == (3, 8)
@@ -97,7 +102,7 @@ class TestEmbedIntervals:
         intervals = [[("chr1", 0, 4)]]
         out_paths = [tmp_path / "out.zarr"]
 
-        embed_intervals(model, fasta, intervals, out_paths, batch_size=2)
+        embed_intervals(model, fasta, intervals, out_paths, vram_coeffs=TEST_VRAM_COEFFS, vram_cap=TEST_VRAM_CAP)
 
         arr = zarr.open(out_paths[0], mode="r")
         assert arr.dtype.name == "float32"
@@ -111,7 +116,7 @@ class TestEmbedIntervals:
         ]
         out_paths = [tmp_path / "out1.zarr", tmp_path / "out2.zarr"]
 
-        embed_intervals(model, fasta, intervals, out_paths, batch_size=2)
+        embed_intervals(model, fasta, intervals, out_paths, vram_coeffs=TEST_VRAM_COEFFS, vram_cap=TEST_VRAM_CAP)
 
         arr1 = zarr.open(out_paths[0], mode="r")
         arr2 = zarr.open(out_paths[1], mode="r")
@@ -121,11 +126,11 @@ class TestEmbedIntervals:
     def test_batching(self, tmp_path: Path):
         model = MockNucleotideModel(edim=8)
         fasta = {"chr1": "A" * 100}
-        # 5 intervals with batch_size=2 should process in 3 batches
+        # 5 intervals should be processed in batches respecting VRAM cap
         intervals = [[("chr1", 0, 4)] * 5]
         out_paths = [tmp_path / "out.zarr"]
 
-        embed_intervals(model, fasta, intervals, out_paths, batch_size=2)
+        embed_intervals(model, fasta, intervals, out_paths, vram_coeffs=TEST_VRAM_COEFFS, vram_cap=TEST_VRAM_CAP)
 
         arr = zarr.open(out_paths[0], mode="r")
         assert arr.shape == (5, 8)
@@ -136,7 +141,7 @@ class TestEmbedIntervals:
         intervals = [[("chr1", 0, 4)]]
         out_paths = [tmp_path / "out.zarr"]
 
-        embed_intervals(model, fasta, intervals, out_paths, batch_size=2)
+        embed_intervals(model, fasta, intervals, out_paths, vram_coeffs=TEST_VRAM_COEFFS, vram_cap=TEST_VRAM_CAP)
 
         lock_dir = tmp_path / ".embed_locks"
         assert not lock_dir.exists()
@@ -147,7 +152,7 @@ class TestEmbedIntervals:
         intervals = [[("chr1", 0, 4)]]
         out_paths = [tmp_path / "subdir" / "nested" / "out.zarr"]
 
-        embed_intervals(model, fasta, intervals, out_paths, batch_size=2)
+        embed_intervals(model, fasta, intervals, out_paths, vram_coeffs=TEST_VRAM_COEFFS, vram_cap=TEST_VRAM_CAP)
 
         assert out_paths[0].exists()
 
@@ -160,7 +165,7 @@ class TestEmbedIntervals:
         # Model should be put in eval mode
         assert model.training  # Initially in training mode
 
-        embed_intervals(model, fasta, intervals, out_paths, batch_size=2)
+        embed_intervals(model, fasta, intervals, out_paths, vram_coeffs=TEST_VRAM_COEFFS, vram_cap=TEST_VRAM_CAP)
 
         assert not model.training  # Should be in eval mode after
 
@@ -170,7 +175,7 @@ class TestEmbedIntervals:
         intervals = [[]]  # Empty interval set
         out_paths = [tmp_path / "out.zarr"]
 
-        embed_intervals(model, fasta, intervals, out_paths, batch_size=2)
+        embed_intervals(model, fasta, intervals, out_paths, vram_coeffs=TEST_VRAM_COEFFS, vram_cap=TEST_VRAM_CAP)
 
         arr = zarr.open(out_paths[0], mode="r")
         assert arr.shape == (0, 8)
