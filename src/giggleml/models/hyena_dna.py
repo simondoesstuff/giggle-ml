@@ -42,7 +42,13 @@ class HyenaDNA(NucleotideModel[dict[str, Tensor]]):
         self.seq_max: int = max_seq_len
         self.edim: int = embed_dim
 
-        self._tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            checkpoint, trust_remote_code=True
+        )
+        # Use right-padding so padding tokens come after actual content.
+        # This ensures embeddings are consistent regardless of padding length,
+        # since the causal convolutions only look at preceding context.
+        self._tokenizer.padding_side = "right"
         # HyenaDNA cannot be torch.compile()d because Hyena layers use FFT
         # which is based on complex numbers. TorchInductor does not support
         # complex operators.
@@ -73,8 +79,7 @@ class HyenaDNA(NucleotideModel[dict[str, Tensor]]):
 
         return self._tokenizer(
             seqs,
-            max_length=self.seq_max,
-            padding="max_length",
+            padding="longest",
             truncation=False,
             add_special_tokens=False,
             return_attention_mask=True,

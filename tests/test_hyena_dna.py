@@ -116,8 +116,7 @@ class TestHyenaDNACollate:
 
         mock_tokenizer.assert_called_once()
         call_kwargs = mock_tokenizer.call_args[1]
-        assert call_kwargs["max_length"] == 1024
-        assert call_kwargs["padding"] == "max_length"
+        assert call_kwargs["padding"] == "longest"
         assert call_kwargs["truncation"] is False
         assert call_kwargs["add_special_tokens"] is False
         assert call_kwargs["return_attention_mask"] is True
@@ -281,13 +280,13 @@ class TestHyenaDNAIntegration:
             batch = model.collate(sequences)
             embeddings = model(batch)
 
-        # Expected values for first 5 dimensions
+        # Expected values for first 5 dimensions (with right-padding, padding="longest")
         # Shape: (2, 128) for 1k model
         expected_first_5_seq1 = torch.tensor(
-            [-0.671875, 0.474609375, -0.60546875, 3.0625, 0.4765625], dtype=torch.float16
+            [-0.59765625, 0.29296875, -0.462890625, 5.5, 0.302734375], dtype=torch.float16
         )
         expected_first_5_seq2 = torch.tensor(
-            [-0.69921875, 0.59765625, -0.5390625, 3.609375, 0.5], dtype=torch.float16
+            [-0.68359375, 0.4140625, -0.53515625, 5.53125, 0.400390625], dtype=torch.float16
         )
 
         assert embeddings.shape == (2, 128)
