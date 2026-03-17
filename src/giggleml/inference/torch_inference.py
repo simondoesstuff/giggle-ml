@@ -1,8 +1,10 @@
 import os
 import shutil
 import socket
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
+from datetime import timedelta
 from pathlib import Path
 from typing import override
 
@@ -85,6 +87,12 @@ def embed_intervals[T](
     """
     assert len(intervals) == len(out_paths)
 
+    # Sort by output path to ensure consistent ordering across all ranks.
+    # Critical for distributed work-stealing: all ranks must iterate in the same order.
+    sort_order = sorted(range(len(out_paths)), key=lambda i: Path(out_paths[i]).stem)
+    intervals = [intervals[i] for i in sort_order]
+    out_paths = [out_paths[i] for i in sort_order]
+
     # Distributed setup - only initialize if actually running in a distributed context
     # (e.g., via torchrun), detected by WORLD_SIZE > 1 or RANK being set
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -102,6 +110,7 @@ def embed_intervals[T](
             rank=rank,
             world_size=world_size,
             device_id=device_id,
+            timeout=timedelta(minutes=5),  # Short timeout - all ranks sync closely
         )
         device = _infer_device(rank)
         print(f"Using {world_size} devices: {device}")
@@ -122,62 +131,100 @@ def embed_intervals[T](
     if dist.is_initialized():
         dist.barrier()
 
-    # Work-stealing at set level: each process races to claim entire interval sets
+    # Pre-compute stems and paths for efficiency
+    out_stems = [Path(out_paths[i]).stem for i in range(n_sets)]
+    done_paths = [lock_dir / f"{stem}.done" for stem in out_stems]
+    lock_paths = [lock_dir / f"{stem}.lock" for stem in out_stems]
+
+    def count_done() -> int:
+        return sum(1 for p in done_paths if p.exists())
+
+    # Work-stealing with retry: each process races to claim interval sets,
+    # retrying until all sets are complete (handles crashed ranks)
+    retry_delay = 2.0  # seconds to wait before retrying when no work available
     with torch.inference_mode():
-        for set_idx in tqdm(range(n_sets), disable=rank != 0):
-            out_stem = Path(out_paths[set_idx]).stem
-            done_path = lock_dir / f"{out_stem}.done"
+        pbar = tqdm(total=n_sets, disable=rank != 0, desc="Embedding sets")
+        pbar.n = count_done()
+        pbar.refresh()
 
-            # Fast path: skip if already processed
-            if done_path.exists():
-                continue
+        while True:
+            processed_any = False
 
-            lock = filelock.FileLock(lock_dir / f"{out_stem}.lock")
-            try:
-                lock.acquire(timeout=0)
-            except filelock.Timeout:
-                continue
+            for set_idx in range(n_sets):
+                done_path = done_paths[set_idx]
 
-            try:
-                # Double-check after acquiring lock
+                # Fast path: skip if already processed
                 if done_path.exists():
                     continue
 
-                # Materialize this interval set
-                all_intervals = list(intervals[set_idx])
-                n_intervals = len(all_intervals)
+                lock = filelock.FileLock(lock_paths[set_idx])
+                try:
+                    lock.acquire(timeout=0)
+                except filelock.Timeout:
+                    # Another rank is working on this file, try next
+                    continue
 
-                # Create output zarr array
-                out_path = Path(out_paths[set_idx])
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                arr = zarr.create_array(
-                    out_path,
-                    shape=(n_intervals, model.edim),
-                    chunks=(min(batch_size, n_intervals), model.edim),
-                    dtype="float32",
-                    overwrite=True,
-                )
+                try:
+                    # Double-check after acquiring lock
+                    if done_path.exists():
+                        continue
 
-                # Process all batches in this set
-                for batch_start in range(0, n_intervals, batch_size):
-                    batch_end = min(batch_start + batch_size, n_intervals)
-                    batch_intervals = all_intervals[batch_start:batch_end]
+                    # Materialize this interval set
+                    all_intervals = list(intervals[set_idx])
+                    n_intervals = len(all_intervals)
 
-                    # intervals -> sequences -> embeddings
-                    sequences = list(fasta_map(fasta, batch_intervals))
-                    batch_input = model.collate(sequences)
-                    if hasattr(batch_input, "to"):
-                        batch_input = batch_input.to(device)  # pyright: ignore[reportAttributeAccessIssue]
+                    # Create output zarr array
+                    out_path = Path(out_paths[set_idx])
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    arr = zarr.create_array(
+                        out_path,
+                        shape=(n_intervals, model.edim),
+                        chunks=(min(batch_size, n_intervals), model.edim),
+                        dtype="float32",
+                        overwrite=True,
+                    )
 
-                    embeddings = model(batch_input)
-                    arr[batch_start:batch_end] = embeddings.cpu().numpy()
+                    # Process all batches in this set
+                    for batch_start in range(0, n_intervals, batch_size):
+                        batch_end = min(batch_start + batch_size, n_intervals)
+                        batch_intervals = all_intervals[batch_start:batch_end]
 
-                # Mark set as complete
-                done_path.touch()
-            finally:
-                lock.release()
+                        # intervals -> sequences -> embeddings
+                        sequences = list(fasta_map(fasta, batch_intervals))
+                        batch_input = model.collate(sequences)
+                        if hasattr(batch_input, "to"):
+                            batch_input = batch_input.to(device)  # pyright: ignore[reportAttributeAccessIssue]
+
+                        embeddings = model(batch_input)
+                        arr[batch_start:batch_end] = embeddings.cpu().numpy()
+
+                    # Mark set as complete
+                    done_path.touch()
+                    processed_any = True
+                    pbar.n = count_done()
+                    pbar.refresh()
+                finally:
+                    lock.release()
+
+            # Check if all done
+            n_done = count_done()
+            if n_done == n_sets:
+                break
+
+            # If we processed something this round, immediately try again
+            if processed_any:
+                continue
+
+            # No work available but not all done - other ranks are working
+            # Wait and retry (handles case where a rank crashes mid-processing)
+            time.sleep(retry_delay)
+
+        pbar.close()
 
     # Final sync and cleanup
+    # Safety: all ranks exit the work loop when count_done() == n_sets (shared FS state).
+    # Maximum skew between ranks reaching this barrier is retry_delay (~2s), well within
+    # the 5-minute timeout set at init_process_group.
     if dist.is_initialized():
         dist.barrier()
 

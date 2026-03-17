@@ -18,13 +18,14 @@ def main(
     batch_size: int,
 ):
     model = HyenaDNA(size)
-    out_paths = [Path(out_dir, file_stem(bed)) for bed in bed_paths]
+    out_paths = [Path(out_dir, f"{file_stem(bed)}.zarr") for bed in bed_paths]
     intervals = [crop_intervals(load_bed(bed), model.seq_max) for bed in bed_paths]
     embed_intervals(
         model, load_fasta(fasta_path), intervals, out_paths, batch_size=batch_size
     )
 
 
+# uv run torchrun --nproc_per_node=4 src/scripts/hyena_dna_many.py
 if __name__ == "__main__":
     batch_size = 76
     rme = Path("data/roadmap_epigenomics")
