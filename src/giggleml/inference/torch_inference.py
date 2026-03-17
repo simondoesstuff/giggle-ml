@@ -144,9 +144,12 @@ def _run_batch_with_oom_retry[T](
     On OOM, halves the batch and retries. Returns the scale factor to apply
     to future VRAM estimates (< 1.0 if OOM occurred).
 
+    Embeddings are returned on-device to allow overlapping computation with
+    device-to-host transfer (caller moves to CPU at write time).
+
     Returns:
         (embeddings, new_idx, vram_scale_multiplier)
-        - embeddings: CPU tensor of shape (actual_batch_size, edim)
+        - embeddings: Device tensor of shape (actual_batch_size, edim)
         - new_idx: Updated index (may be less than current_idx if batch was split)
         - vram_scale_multiplier: Multiply into vram_scale (1.0 if no OOM, <1.0 if OOM)
     """
@@ -159,7 +162,7 @@ def _run_batch_with_oom_retry[T](
             if hasattr(batch_input, "to"):
                 batch_input = batch_input.to(device)  # pyright: ignore[reportAttributeAccessIssue]
 
-            embeddings = model(batch_input).cpu()
+            embeddings = model(batch_input)
             return embeddings, current_idx, scale_multiplier
 
         except RuntimeError as e:
@@ -227,10 +230,10 @@ def _process_interval_set[T](
         vram_scale *= scale_mult
         cached_embeddings.append(embeddings)
 
-        # --- Chunk-aligned zarr writes ---
+        # --- Chunk-aligned zarr writes (transfer to CPU here) ---
         cached_count = sum(e.shape[0] for e in cached_embeddings)
         if cached_count >= chunk_size or i == n_intervals:
-            combined = torch.cat(cached_embeddings, dim=0)
+            combined = torch.cat(cached_embeddings, dim=0).cpu()
             arr[cache_start : cache_start + combined.shape[0]] = combined.numpy()
             cache_start += combined.shape[0]
             cached_embeddings = []
