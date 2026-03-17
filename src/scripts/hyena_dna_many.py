@@ -16,6 +16,7 @@ def main(
     bed_paths: Sequence[Pathish],
     out_dir: Pathish,
     vram_cap: float,
+    zarr_chunk_size: int,
 ):
     model = HyenaDNA(size)
     out_paths = [Path(out_dir, f"{file_stem(bed)}.zarr") for bed in bed_paths]
@@ -33,6 +34,7 @@ def main(
         out_paths,
         vram_coeffs=model.vram_coeffs,
         vram_cap=vram_cap,
+        zarr_chunk_size=zarr_chunk_size,
     )
 
 
@@ -45,5 +47,7 @@ if __name__ == "__main__":
         "data/hg/hg38.fa",
         beds,
         rme / "embeds",
-        vram_cap=8 * 1024**3,  # 8 GB
+        # about 42% for one batch, 42% for the last batch, ~15% spare
+        vram_cap=10 * 1024**3,  # GiB
+        zarr_chunk_size=int(250e3),  # 128MB at 128d f32
     )

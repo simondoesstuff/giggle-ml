@@ -74,6 +74,7 @@ def embed_intervals[T](
     *,
     vram_coeffs: VRAMCoeffs,
     vram_cap: float,
+    zarr_chunk_size: int = 256,
 ) -> None:
     """Embed interval sets across all GPUs using torchrun and save to Zarr v3.
 
@@ -84,6 +85,9 @@ def embed_intervals[T](
     accumulated until adding another would exceed the estimated VRAM cap.
     This minimizes padding waste when intervals are sorted by size.
 
+    Embeddings are cached in memory and written to zarr in chunk-aligned blocks
+    to minimize I/O overhead.
+
     Args:
         model: The nucleotide embedding model.
         fasta: Dictionary mapping chromosome names to sequences.
@@ -91,6 +95,7 @@ def embed_intervals[T](
         out_paths: Output zarr array path for each interval set.
         vram_coeffs: VRAM model coefficients (from estimate_vram_coefficients.py).
         vram_cap: Target VRAM cap in bytes.
+        zarr_chunk_size: Number of embeddings per zarr chunk (default 256).
     """
     assert len(intervals) == len(out_paths)
 
@@ -183,7 +188,7 @@ def embed_intervals[T](
                     # Create output zarr array
                     out_path = Path(out_paths[set_idx])
                     out_path.parent.mkdir(parents=True, exist_ok=True)
-                    chunk_size = min(256, n_intervals)
+                    chunk_size = min(zarr_chunk_size, n_intervals)
                     arr = zarr.create_array(
                         out_path,
                         shape=(n_intervals, model.edim),
@@ -193,9 +198,12 @@ def embed_intervals[T](
                     )
 
                     # Process batches with dynamic sizing based on VRAM model
+                    # Cache embeddings and write in chunk-aligned blocks
                     i = 0
+                    cached_embeddings: list[torch.Tensor] = []
+                    cache_start = 0  # Start index for cached embeddings
+
                     while i < n_intervals:
-                        batch_start = i
                         batch_intervals: list[GenomicInterval] = []
                         batch_max_len = 0
 
@@ -218,16 +226,22 @@ def embed_intervals[T](
 
                         # intervals -> sequences -> embeddings
                         sequences = list(fasta_map(fasta, batch_intervals))
-                        batch_total = sum(len(s) for s in sequences)
-                        est_mb = vram_coeffs.estimate(len(sequences), batch_max_len) / (
-                            1024 * 1024
-                        )
                         batch_input = model.collate(sequences)
                         if hasattr(batch_input, "to"):
                             batch_input = batch_input.to(device)  # pyright: ignore[reportAttributeAccessIssue]
 
-                        embeddings = model(batch_input)
-                        arr[batch_start:i] = embeddings.cpu().numpy()
+                        embeddings = model(batch_input).cpu()
+                        cached_embeddings.append(embeddings)
+
+                        # Write when we've accumulated a full chunk or reached the end
+                        cached_count = sum(e.shape[0] for e in cached_embeddings)
+                        if cached_count >= chunk_size or i == n_intervals:
+                            combined = torch.cat(cached_embeddings, dim=0)
+                            arr[cache_start : cache_start + combined.shape[0]] = (
+                                combined.numpy()
+                            )
+                            cache_start += combined.shape[0]
+                            cached_embeddings = []
 
                     # Mark set as complete
                     done_path.touch()
@@ -248,6 +262,9 @@ def embed_intervals[T](
 
             # No work available but not all done - other ranks are working
             # Wait and retry (handles case where a rank crashes mid-processing)
+            # Update progress bar to reflect work done by other ranks
+            pbar.n = n_done
+            pbar.refresh()
             time.sleep(retry_delay)
 
         pbar.close()
