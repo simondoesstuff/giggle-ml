@@ -202,10 +202,12 @@ def embed_intervals[T](
                     i = 0
                     cached_embeddings: list[torch.Tensor] = []
                     cache_start = 0  # Start index for cached embeddings
+                    vram_scale = 1.0  # Reduced on OOM to shrink future batches
 
                     while i < n_intervals:
                         batch_intervals: list[GenomicInterval] = []
                         batch_max_len = 0
+                        effective_cap = vram_cap * vram_scale
 
                         # Accumulate intervals until adding another exceeds VRAM cap
                         while i < n_intervals:
@@ -217,21 +219,53 @@ def embed_intervals[T](
                             # Always include at least one interval per batch
                             if batch_intervals:
                                 est_vram = vram_coeffs.estimate(new_n, new_max_len)
-                                if est_vram > vram_cap:
+                                if est_vram > effective_cap:
                                     break
 
                             batch_intervals.append(interval)
                             batch_max_len = new_max_len
                             i += 1
 
-                        # intervals -> sequences -> embeddings
-                        sequences = list(fasta_map(fasta, batch_intervals))
-                        batch_input = model.collate(sequences)
-                        if hasattr(batch_input, "to"):
-                            batch_input = batch_input.to(device)  # pyright: ignore[reportAttributeAccessIssue]
+                        # intervals -> sequences -> embeddings (with OOM retry)
+                        while True:
+                            try:
+                                sequences = list(fasta_map(fasta, batch_intervals))
+                                batch_input = model.collate(sequences)
+                                if hasattr(batch_input, "to"):
+                                    batch_input = batch_input.to(device)  # pyright: ignore[reportAttributeAccessIssue]
 
-                        embeddings = model(batch_input).cpu()
-                        cached_embeddings.append(embeddings)
+                                embeddings = model(batch_input).cpu()
+                                cached_embeddings.append(embeddings)
+                                break  # Success, exit retry loop
+                            except RuntimeError as e:
+                                # Only handle OOM errors, re-raise everything else
+                                is_oom = (
+                                    isinstance(e, torch.OutOfMemoryError)
+                                    or "out of memory" in str(e).lower()
+                                )
+                                if not is_oom:
+                                    raise
+
+                                # Clear GPU memory
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+
+                                if len(batch_intervals) == 1:
+                                    # Can't reduce further, re-raise
+                                    raise RuntimeError(
+                                        f"OOM on single interval of size {batch_intervals[0][2] - batch_intervals[0][1]}"
+                                    ) from e
+
+                                # Halve the batch and put the rest back
+                                split = len(batch_intervals) // 2
+                                i -= (
+                                    len(batch_intervals) - split
+                                )  # Put back unused intervals
+                                batch_intervals = batch_intervals[:split]
+                                vram_scale *= 0.80  # Reduce future batch sizes
+                                print(
+                                    f"OOM: reducing batch to {split}, vram_scale={vram_scale:.2f}"
+                                )
 
                         # Write when we've accumulated a full chunk or reached the end
                         cached_count = sum(e.shape[0] for e in cached_embeddings)
