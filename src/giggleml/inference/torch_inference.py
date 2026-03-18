@@ -375,5 +375,6 @@ def embed_intervals[T](
     # -------------------------------------------------------------------------
     if dist.is_initialized():
         dist.barrier()
+        dist.destroy_process_group()
     if rank == 0:
         shutil.rmtree(lock_dir)
