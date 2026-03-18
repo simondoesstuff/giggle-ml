@@ -166,9 +166,11 @@ def _run_batch_with_oom_retry[T](
             return embeddings, current_idx, scale_multiplier
 
         except RuntimeError as e:
+            err_msg = str(e).lower()
             is_oom = (
                 isinstance(e, torch.OutOfMemoryError)
-                or "out of memory" in str(e).lower()
+                or "out of memory" in err_msg
+                or "cufft" in err_msg  # cuFFT errors often indicate memory pressure
             )
             if not is_oom:
                 raise
