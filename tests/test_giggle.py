@@ -166,7 +166,7 @@ class TestGiggleIndex:
             cmd = mock_run.call_args[0][0]
             assert "-l" in cmd
 
-    def test_list_beds_skips_header(self, mock_tools, temp_dir):
+    def test_list_beds_skips_hash_header(self, mock_tools, temp_dir):
         temp_dir.with_suffix(".giggle").mkdir()
         index = GiggleIndex(temp_dir)
 
@@ -183,6 +183,26 @@ class TestGiggleIndex:
 
             assert beds == {"sample1.bed.gz", "sample2.bed.gz"}
             assert len(beds) == 2
+
+    def test_list_beds_skips_non_bed_lines(self, mock_tools, temp_dir):
+        """Filter out header lines without # prefix (e.g., 'File name' column header)."""
+        temp_dir.with_suffix(".giggle").mkdir()
+        index = GiggleIndex(temp_dir)
+
+        giggle_output = (
+            f"File name\tsize\n"
+            f"{temp_dir}/sample1.bed.gz\t1000\n{temp_dir}/sample2.bed.gz\t2000\n"
+        )
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout=giggle_output, stderr=""
+            )
+            beds = index.list_beds
+
+            assert beds == {"sample1.bed.gz", "sample2.bed.gz"}
+            assert len(beds) == 2
+            assert "File name" not in beds
 
     def test_list_beds_caches_result(self, mock_tools, temp_dir):
         temp_dir.with_suffix(".giggle").mkdir()

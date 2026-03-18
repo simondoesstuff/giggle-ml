@@ -142,7 +142,8 @@ class GiggleIndex:
             parts = line.split("\t")
             if parts:
                 filename = Path(parts[0]).name
-                if filename:
+                # Filter out header lines like "File name" that don't end with .bed/.bed.gz
+                if filename and (filename.endswith(".bed") or filename.endswith(".bed.gz")):
                     beds.add(filename)
         return beds
 
