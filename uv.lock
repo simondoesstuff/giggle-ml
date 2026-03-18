@@ -286,7 +286,7 @@ requires-dist = [
     { name = "jaxtyping", specifier = ">=0.3.9" },
     { name = "matplotlib", specifier = ">=3.10.1" },
     { name = "numpy", specifier = ">=2.2.5" },
-    { name = "optax", specifier = ">=0.2.7" },
+    { name = "optax", git = "https://github.com/google-deepmind/optax.git?rev=cbcd61da" },
     { name = "pyfastx", specifier = ">=2.3.0" },
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "scikit-learn", specifier = ">=1.6.1" },
@@ -921,17 +921,13 @@ wheels = [
 
 [[package]]
 name = "optax"
-version = "0.2.7"
-source = { registry = "https://pypi.org/simple" }
+version = "0.2.8.dev0"
+source = { git = "https://github.com/google-deepmind/optax.git?rev=cbcd61da#cbcd61da5cc151ac13cdfb5aaaf3c8ed5ce75906" }
 dependencies = [
     { name = "absl-py" },
     { name = "jax" },
     { name = "jaxlib" },
     { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/de/f7/a63fc3d262d7a58d7d53050dea1408a63738739569af34f8f754cf181ab1/optax-0.2.7.tar.gz", hash = "sha256:8b6b2e5bd62bcc6c11f6172a1aff0d86da0eaeecbd5465b2b366b5d3d64f6efc", size = 297524, upload-time = "2026-02-05T20:49:28.749Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b8/1e/94ad43e06887244b4d25f58b689122270ba3c129d3448052958eecf7518a/optax-0.2.7-py3-none-any.whl", hash = "sha256:241f2dfa104eab4fec2e16e7919f88df24a3da1481f95e264b3db396b30d4ff6", size = 399395, upload-time = "2026-02-05T20:49:26.883Z" },
 ]
 
 [[package]]
