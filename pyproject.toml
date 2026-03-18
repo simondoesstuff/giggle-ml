@@ -10,6 +10,7 @@ dependencies = [
   "einx @ git+https://github.com/simondoesstuff/einx.git",
   "equinox>=0.13.6",
   "filelock>=3.18.0",
+  "jax[cuda]>=0.9.1 ; sys_platform == 'linux'",
   "jaxtyping>=0.3.9",
   "matplotlib>=3.10.1",
   "numpy>=2.2.5",
