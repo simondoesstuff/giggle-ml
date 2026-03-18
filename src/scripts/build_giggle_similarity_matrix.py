@@ -62,6 +62,13 @@ Examples:
         action="store_true",
         help="Don't enforce matrix symmetry (by default, M[a,b] = M[b,a] = max)",
     )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: CPU count)",
+    )
 
     args = parser.parse_args()
 
@@ -71,13 +78,15 @@ Examples:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Creating giggle index from: {args.bed_dir}")
     index = GiggleIndex(
         args.bed_dir,
         index_dir=args.index_dir,
         sorted=not args.unsorted,
         genome_size=args.genome_size,
     )
+
+    print(f"Building giggle index from: {args.bed_dir}")
+    index.build_index()
 
     n_beds = len(index.list_beds)
     print(f"Found {n_beds} BED files in index")
@@ -91,6 +100,7 @@ Examples:
         index,
         args.output,
         symmetric=not args.asymmetric,
+        n_jobs=args.jobs,
     )
 
     print(f"Done. Matrix shape: {matrix.n} x {matrix.n}")

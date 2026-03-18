@@ -106,11 +106,11 @@ class TestGiggleIndex:
         index = GiggleIndex(temp_dir)
         assert index.exists
 
-    def test_index_dir_creates_when_missing(self, mock_tools, temp_dir):
+    def test_build_index_creates_when_missing(self, mock_tools, temp_dir):
         index = GiggleIndex(temp_dir)
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            _ = index.index_dir
+            index.build_index()
 
             mock_run.assert_called_once()
             cmd = mock_run.call_args[0][0]
@@ -120,21 +120,33 @@ class TestGiggleIndex:
             assert "-o" in cmd
             assert "-s" not in cmd
 
-    def test_index_dir_with_sorted_flag(self, mock_tools, temp_dir):
+    def test_build_index_with_sorted_flag(self, mock_tools, temp_dir):
         index = GiggleIndex(temp_dir, sorted=True)
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            _ = index.index_dir
+            index.build_index()
 
             cmd = mock_run.call_args[0][0]
             assert "-s" in cmd
 
-    def test_index_dir_skips_when_exists(self, mock_tools, temp_dir):
+    def test_build_index_skips_when_exists(self, mock_tools, temp_dir):
         temp_dir.with_suffix(".giggle").mkdir()
         index = GiggleIndex(temp_dir)
         with patch("subprocess.run") as mock_run:
-            _ = index.index_dir
+            index.build_index()
             mock_run.assert_not_called()
+
+    def test_build_index_force_rebuilds(self, mock_tools, temp_dir):
+        index_dir = temp_dir.with_suffix(".giggle")
+        index_dir.mkdir()
+        (index_dir / "some_file").write_text("data")
+        index = GiggleIndex(temp_dir)
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            index.build_index(force=True)
+
+            assert not (index_dir / "some_file").exists()
+            mock_run.assert_called_once()
 
     def test_list_beds(self, mock_tools, temp_dir):
         temp_dir.with_suffix(".giggle").mkdir()
@@ -153,6 +165,24 @@ class TestGiggleIndex:
             assert beds == {"sample1.bed.gz", "sample2.bed.gz"}
             cmd = mock_run.call_args[0][0]
             assert "-l" in cmd
+
+    def test_list_beds_skips_header(self, mock_tools, temp_dir):
+        temp_dir.with_suffix(".giggle").mkdir()
+        index = GiggleIndex(temp_dir)
+
+        giggle_output = (
+            f"#file\tfile_size\n"
+            f"{temp_dir}/sample1.bed.gz\t1000\n{temp_dir}/sample2.bed.gz\t2000\n"
+        )
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout=giggle_output, stderr=""
+            )
+            beds = index.list_beds
+
+            assert beds == {"sample1.bed.gz", "sample2.bed.gz"}
+            assert len(beds) == 2
 
     def test_list_beds_caches_result(self, mock_tools, temp_dir):
         temp_dir.with_suffix(".giggle").mkdir()

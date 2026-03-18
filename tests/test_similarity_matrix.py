@@ -90,7 +90,7 @@ class TestBuildFromGiggle:
         # self_query returns results for each file
         mock_index.self_query.return_value = []
 
-        matrix = SimilarityMatrix.build_from_giggle(mock_index, path)
+        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, n_jobs=1)
 
         assert matrix.n == 3
         assert mock_index.self_query.call_count == 3
@@ -127,7 +127,7 @@ class TestBuildFromGiggle:
 
         mock_index.self_query.side_effect = mock_self_query
 
-        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, symmetric=False)
+        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, symmetric=False, n_jobs=1)
 
         # Beds are sorted: a, b, c -> indices 0, 1, 2
         assert float(matrix[0, 0]) == pytest.approx(100.0, rel=1e-2)
@@ -168,7 +168,7 @@ class TestBuildFromGiggle:
 
         mock_index.self_query.side_effect = mock_self_query
 
-        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, symmetric=True)
+        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, symmetric=True, n_jobs=1)
 
         # Both directions should have max value (30.0)
         # a=0, b=1
@@ -211,7 +211,7 @@ class TestBuildFromGiggle:
 
         mock_index.self_query.side_effect = mock_self_query
 
-        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, symmetric=True)
+        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, symmetric=True, n_jobs=1)
 
         # Both directions should have max value (-5.0, not 0)
         # a=0, b=1
@@ -252,7 +252,7 @@ class TestBuildFromGiggle:
 
         mock_index.self_query.side_effect = mock_self_query
 
-        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, symmetric=False)
+        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, symmetric=False, n_jobs=1)
 
         # a=0, b=1 - each direction keeps its own value
         assert float(matrix[0, 1]) == pytest.approx(25.0, rel=1e-2)
@@ -277,7 +277,7 @@ class TestBuildFromGiggle:
 
         mock_index.self_query.side_effect = mock_self_query
 
-        matrix = SimilarityMatrix.build_from_giggle(mock_index, path)
+        matrix = SimilarityMatrix.build_from_giggle(mock_index, path, n_jobs=1)
 
         # Matrix should be all zeros since unknown file is ignored
         assert np.all(matrix.array == 0)
@@ -289,7 +289,7 @@ class TestBuildFromGiggle:
         index.self_query.return_value = []
 
         path = tmp_path / "matrix.mmap"
-        SimilarityMatrix.build_from_giggle(index, path)
+        SimilarityMatrix.build_from_giggle(index, path, n_jobs=1)
 
         # Verify calls were made in sorted order
         calls = [call[0][0] for call in index.self_query.call_args_list]

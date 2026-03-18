@@ -80,9 +80,33 @@ class GiggleIndex:
         """The directory containing indexed BED files."""
         return self._directory
 
-    @cached_property
+    @property
+    def genome_size(self) -> int | None:
+        """Genome size for significance testing."""
+        return self._genome_size
+
+    @property
     def index_dir(self) -> Path:
-        """The giggle index directory. Creates the index if it doesn't exist."""
+        """The giggle index directory. Call build_index() first if it doesn't exist."""
+        return self._index_dir_path
+
+    @property
+    def exists(self) -> bool:
+        """Whether the index already exists."""
+        return self._index_dir_path.is_dir()
+
+    def build_index(self, *, force: bool = False) -> Path:
+        """Build the giggle index.
+
+        Args:
+            force: If True, rebuild even if index already exists.
+
+        Returns:
+            Path to the index directory.
+        """
+        if force and self._index_dir_path.is_dir():
+            shutil.rmtree(self._index_dir_path)
+
         if not self._index_dir_path.is_dir():
             cmd = [
                 "giggle",
@@ -95,12 +119,8 @@ class GiggleIndex:
             if self._sorted:
                 cmd.append("-s")
             subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return self._index_dir_path
 
-    @property
-    def exists(self) -> bool:
-        """Whether the index already exists."""
-        return self._index_dir_path.is_dir()
+        return self._index_dir_path
 
     @cached_property
     def list_beds(self) -> set[str]:
@@ -117,12 +137,13 @@ class GiggleIndex:
         )
         beds = set()
         for line in result.stdout.strip().split("\n"):
-            if line:
-                parts = line.split("\t")
-                if parts:
-                    filename = Path(parts[0]).name
-                    if filename:
-                        beds.add(filename)
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if parts:
+                filename = Path(parts[0]).name
+                if filename:
+                    beds.add(filename)
         return beds
 
     def _parse_output(self, output: str) -> list[GiggleResult]:
@@ -259,10 +280,6 @@ class GiggleIndex:
 
     def reindex(self) -> None:
         """Force recreation of the index."""
-        if self._index_dir_path.is_dir():
-            shutil.rmtree(self._index_dir_path)
-        # Clear cached properties
-        self.__dict__.pop("index_dir", None)
+        # Clear cached list_beds
         self.__dict__.pop("list_beds", None)
-        # Trigger index creation
-        _ = self.index_dir
+        self.build_index(force=True)

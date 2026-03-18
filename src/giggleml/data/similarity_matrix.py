@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from functools import partial
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Literal
 
@@ -9,10 +12,27 @@ import numpy as np
 from numpy.typing import NDArray
 from tqdm import tqdm
 
-from giggleml.data.giggle import GiggleIndex
+from giggleml.data.giggle import GiggleIndex, GiggleResult
 from giggleml.utils.file_utils import Pathish
 
 type MemMapMode = Literal["r", "r+", "w+", "c"]
+
+
+def _query_bed_worker(
+    bed: str,
+    directory: Path,
+    index_dir: Path,
+    genome_size: int | None,
+) -> tuple[str, list[GiggleResult]]:
+    """Worker function for parallel query.
+
+    Creates a fresh GiggleIndex in the subprocess (reuses existing index on disk)
+    and queries directly by path to avoid redundant list_beds calls.
+    """
+    index = GiggleIndex(directory, index_dir=index_dir, genome_size=genome_size)
+    query_path = directory / bed
+    results = index.query(query_path)
+    return bed, results
 
 
 class SimilarityMatrix:
@@ -97,6 +117,7 @@ class SimilarityMatrix:
         output_path: Pathish,
         *,
         symmetric: bool = True,
+        n_jobs: int | None = None,
     ) -> "SimilarityMatrix":
         """Build a similarity matrix from a GiggleIndex using combo scores.
 
@@ -107,24 +128,53 @@ class SimilarityMatrix:
             index: GiggleIndex to query.
             output_path: Path for the output similarity matrix file.
             symmetric: If True, enforce M[a,b] = M[b,a] by taking max on conflict.
+            n_jobs: Number of parallel workers. Defaults to CPU count. Use 1 for
+                sequential execution (useful for testing).
 
         Returns:
             The populated SimilarityMatrix.
         """
+        # Ensure index is built before spawning workers
+        index.build_index()
+
         beds = sorted(index.list_beds)
         n = len(beds)
         bed_to_idx = {bed: i for i, bed in enumerate(beds)}
 
         matrix = SimilarityMatrix(output_path, n, mode="w+")
 
-        for i, bed in tqdm(enumerate(beds), desc="Building (giggle) similarity matrix"):
-            results = index.self_query(bed)
+        n_jobs = n_jobs or os.cpu_count() or 1
 
+        def populate_row(bed: str, results: list[GiggleResult]) -> None:
+            i = bed_to_idx[bed]
             for result in results:
                 if result.file not in bed_to_idx:
                     continue
                 j = bed_to_idx[result.file]
                 matrix[i, j] = result.combo_score
+
+        if n_jobs == 1:
+            # Sequential mode - use self_query directly (no pickling needed)
+            for bed in tqdm(beds, desc="Building similarity matrix"):
+                results = index.self_query(bed)
+                populate_row(bed, results)
+        else:
+            # Parallel mode - use worker function with Pool
+            worker = partial(
+                _query_bed_worker,
+                directory=index.directory,
+                index_dir=index.index_dir,
+                genome_size=index.genome_size,
+            )
+
+            with Pool(processes=n_jobs) as pool:
+                results_iter = pool.imap_unordered(worker, beds)
+                for bed, results in tqdm(
+                    results_iter,
+                    total=n,
+                    desc=f"Building similarity matrix ({n_jobs} workers)",
+                ):
+                    populate_row(bed, results)
 
         if symmetric:
             # Enforce symmetry by taking element-wise max with transpose
