@@ -37,16 +37,25 @@ def random_sequence(length: int) -> str:
     return "".join(random.choices(NUCLEOTIDES, k=length))
 
 
+def reset_cuda_state(model: HyenaDNA, device: torch.device) -> None:
+    """Reset CUDA state to prevent trial leakage."""
+    model.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+
+
 def measure_vram(
     model: HyenaDNA,
     n: int,
     k: int,
     device: torch.device,
 ) -> int:
-    """Measure peak VRAM usage for a forward pass.
+    """Measure peak reserved VRAM for a forward pass.
 
     Clears CUDA caches, runs a forward pass with random sequences,
-    and returns the peak memory allocated above baseline.
+    and returns the peak reserved memory above baseline. Reserved memory
+    is more accurate for capacity planning than allocated memory.
 
     Args:
         model: HyenaDNA model (already on device).
@@ -55,15 +64,12 @@ def measure_vram(
         device: CUDA device.
 
     Returns:
-        Peak VRAM usage in bytes (excluding model parameters).
+        Peak reserved VRAM in bytes (excluding model parameters).
     """
-    # Clear caches
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
+    reset_cuda_state(model, device)
 
-    # Baseline memory (model params + cuda context)
-    baseline = torch.cuda.memory_allocated(device)
+    # Baseline reserved memory (model params + cuda context)
+    baseline = torch.cuda.memory_reserved(device)
 
     # Generate random sequences and run forward pass
     sequences = [random_sequence(k) for _ in range(n)]
@@ -74,7 +80,11 @@ def measure_vram(
         _ = model(batch)
         torch.cuda.synchronize(device)
 
-    peak = torch.cuda.max_memory_allocated(device)
+    peak = torch.cuda.max_memory_reserved(device)
+
+    # Clean up batch tensors before next measurement
+    del batch, sequences
+
     return peak - baseline
 
 

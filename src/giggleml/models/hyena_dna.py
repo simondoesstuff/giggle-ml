@@ -20,14 +20,15 @@ MODEL_CONFIGS: dict[str, tuple[int, str, int, str]] = {
 }
 
 # VRAM coefficients for V(n, k) = a*n*k_fft + b*n + c where k_fft = next_pow2(2k-1)
-# Estimated via scripts/estimate_vram_coefficients.py (c set to 0, CI too wide)
+# Estimated via scripts/estimate_vram_coefficients.py using reserved memory
+# c set to 0 (CI too wide), 160k b set to 0 (CI crosses 0)
 _VRAM_COEFFS: dict[str, VRAMCoeffs] = {
-    "1k": VRAMCoeffs(a=6546.0, b=348092.0, c=0.0),
-    "16k": VRAMCoeffs(a=6966.0, b=337772.0, c=0.0),
-    "32k": VRAMCoeffs(a=12393.0, b=749894.0, c=0.0),
-    "160k": VRAMCoeffs(a=13178.0, b=673388.0, c=0.0),
-    "450k": VRAMCoeffs(a=13723.0, b=483761.0, c=0.0),
-    "1m": VRAMCoeffs(a=14904.0, b=251045.0, c=0.0),
+    "1k": VRAMCoeffs(a=7816.0, b=724568.0, c=0.0),
+    "16k": VRAMCoeffs(a=8426.0, b=658224.0, c=0.0),
+    "32k": VRAMCoeffs(a=15662.0, b=1067575.0, c=0.0),
+    "160k": VRAMCoeffs(a=16480.0, b=1028624.0, c=0.0),
+    "450k": VRAMCoeffs(a=15489.0, b=1277878.0, c=0.0),
+    "1m": VRAMCoeffs(a=16128.0, b=1316533.0, c=0.0),
 }
 
 

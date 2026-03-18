@@ -10,3 +10,6 @@ test *args: typecheck
 alias i := install
 install:
 	uv sync && uv pip install -e .
+
+pull path target='layerlab':
+	scp layerlab:~/projects/giggle-ml/{{path}} .
