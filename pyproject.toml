@@ -13,6 +13,7 @@ dependencies = [
   "jaxtyping>=0.3.9",
   "matplotlib>=3.10.1",
   "numpy>=2.2.5",
+  "optax>=0.2.7",
   "pyfastx>=2.3.0",
   "pytest>=8.3.5",
   "scikit-learn>=1.6.1",
