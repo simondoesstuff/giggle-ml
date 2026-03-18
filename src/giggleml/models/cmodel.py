@@ -16,7 +16,10 @@ Reference: Jaegle et al. "Perceiver IO: A General Architecture for Structured In
 import einx
 import equinox as eqx
 import jax
-from jaxtyping import Array, Float, PRNGKeyArray
+import jax.numpy as jnp
+from jaxtyping import Array, Float, Int, PRNGKeyArray
+
+from giggleml.models.genomic_interval import GenomicIntervalEncoder
 
 
 class CrossAttention(eqx.Module):
@@ -88,10 +91,16 @@ class CModel(eqx.Module):
     """PerceiverIO-based encoder with input FFN and configurable weight sharing.
 
     Architecture:
-        1. Input FFN: feature extraction (input_dim -> input_dim)
-        2. Cross-attention: project inputs to latent space
-        3. Encoder stack: self-attention blocks with weight sharing
-        4. Pooling: decode (default), mean, first, or none
+        1. (Optional) Genomic interval encoding: encode intervals and concat with seq embeddings
+        2. Input FFN: feature extraction (input_dim -> input_dim)
+        3. Cross-attention: project inputs to latent space
+        4. Encoder stack: self-attention blocks with weight sharing
+        5. Pooling: decode (default), mean, first, or none
+
+    Usage modes:
+        - With intervals: model(seq_embeddings, intervals) - encodes intervals and concatenates
+        - Without intervals: model(seq_embeddings) - uses seq_embeddings directly as input
+        - Raw features: model.forward_features(inputs) - bypasses interval encoding
 
     Pooling modes:
         - decode: apply output FFN to first latent (default)
@@ -112,6 +121,7 @@ class CModel(eqx.Module):
     encoder_blocks: list[EncoderBlock]
     output_norm: eqx.nn.LayerNorm
     output_ffn: eqx.nn.MLP | None
+    interval_encoder: GenomicIntervalEncoder | None
     shared_per_stack: int = eqx.field(static=True)
     num_stacks: int = eqx.field(static=True)
     pooling: str = eqx.field(static=True)
@@ -130,6 +140,7 @@ class CModel(eqx.Module):
         output_dim: int | None = None,
         output_ff_hidden_dim: int | None = None,
         pooling: str = "decode",
+        interval_encoder: GenomicIntervalEncoder | None = None,
         key: PRNGKeyArray,
     ):
         super().__init__()
@@ -179,10 +190,23 @@ class CModel(eqx.Module):
         else:
             self.output_ffn = None
 
-    def __call__(
+        self.interval_encoder = interval_encoder
+
+    def forward_features(
         self,
         inputs: Float[Array, "input_len input_dim"],
     ) -> Float[Array, "..."]:
+        """Process pre-computed feature vectors through the model.
+
+        Use this method directly when you have raw feature vectors that don't
+        need interval encoding. This is the original forward pass logic.
+
+        Args:
+            inputs: Input features of shape (input_len, input_dim).
+
+        Returns:
+            Output based on pooling mode.
+        """
         inputs = jax.vmap(self.input_ffn)(inputs)
 
         # Cross-attention: project inputs to latent space
@@ -204,9 +228,42 @@ class CModel(eqx.Module):
             return latents[0]
         return latents
 
+    def __call__(
+        self,
+        seq_embeddings: Float[Array, "input_len seq_dim"],
+        intervals: Int[Array, "input_len 3"] | None = None,
+    ) -> Float[Array, "..."]:
+        """Process sequence embeddings with optional genomic interval encoding.
+
+        Args:
+            seq_embeddings: Sequence embeddings of shape (input_len, seq_dim).
+                If intervals is None, this is used directly as input features.
+            intervals: Optional genomic intervals of shape (input_len, 3) where
+                each row is [chrm, start, end]. If provided, intervals are encoded
+                and concatenated with seq_embeddings.
+
+        Returns:
+            Output based on pooling mode.
+        """
+        if intervals is None:
+            # No intervals provided, use seq_embeddings directly
+            return self.forward_features(seq_embeddings)
+
+        # Encode intervals and concatenate with sequence embeddings
+        if self.interval_encoder is None:
+            raise ValueError(
+                "intervals provided but no interval_encoder configured. "
+                "Pass interval_encoder to CModel or use forward_features() directly."
+            )
+
+        interval_embs = self.interval_encoder.encode_batch(intervals)
+        inputs = jnp.concatenate([seq_embeddings, interval_embs], axis=-1)
+        return self.forward_features(inputs)
+
 
 def create_cmodel(
-    input_dim: int = 256,
+    input_dim: int | None = None,
+    seq_dim: int | None = None,
     latent_dim: int = 512,
     num_latents: int = 64,
     shared_per_stack: int = 2,
@@ -217,12 +274,24 @@ def create_cmodel(
     output_dim: int | None = None,
     output_ff_mult: int = 4,
     pooling: str = "decode",
+    interval_chrm_dim: int = 16,
+    interval_size_dim: int = 16,
+    interval_center_dim: int = 32,
+    num_chrms: int = 24,
+    max_wavelength: float = 250_000_000.0,
     key: PRNGKeyArray | None = None,
 ) -> CModel:
     """Factory function to create a CModel with common defaults.
 
+    Two modes of operation:
+        1. Raw features: specify input_dim only (no interval encoding)
+        2. With intervals: specify seq_dim (interval encoder created automatically,
+           input_dim = seq_dim + interval_dim)
+
     Args:
-        input_dim: Dimension of input features.
+        input_dim: Dimension of input features (for raw feature mode).
+        seq_dim: Dimension of sequence embeddings (for interval mode).
+            If provided, creates interval encoder and sets input_dim = seq_dim + interval_dim.
         latent_dim: Dimension of latent space.
         num_latents: Number of latent vectors.
         shared_per_stack: Number of unique encoder blocks (weight sharing unit).
@@ -233,6 +302,11 @@ def create_cmodel(
         output_dim: Output dimension for decode mode (defaults to latent_dim).
         output_ff_mult: Output FFN hidden dimension multiplier (relative to latent_dim).
         pooling: Output pooling strategy ('decode', 'mean', 'first', or 'none').
+        interval_chrm_dim: Chromosome embedding dimension (interval mode only).
+        interval_size_dim: Size encoding dimension (interval mode only).
+        interval_center_dim: Center PE dimension (interval mode only).
+        num_chrms: Number of chromosomes (interval mode only).
+        max_wavelength: Max wavelength for genomic PE (interval mode only).
         key: PRNG key for initialization.
 
     Returns:
@@ -240,6 +314,29 @@ def create_cmodel(
     """
     if key is None:
         key = jax.random.key(0)
+
+    if seq_dim is not None and input_dim is not None:
+        raise ValueError("Specify either input_dim or seq_dim, not both")
+    if seq_dim is None and input_dim is None:
+        input_dim = 256  # Default for backwards compatibility
+
+    interval_encoder: GenomicIntervalEncoder | None = None
+
+    if seq_dim is not None:
+        # Interval mode: create encoder and compute input_dim
+        keys = jax.random.split(key, 2)
+        interval_encoder = GenomicIntervalEncoder(
+            chrm_dim=interval_chrm_dim,
+            size_dim=interval_size_dim,
+            center_dim=interval_center_dim,
+            num_chrms=num_chrms,
+            max_wavelength=max_wavelength,
+            key=keys[0],
+        )
+        input_dim = seq_dim + interval_encoder.dim
+        key = keys[1]
+
+    assert input_dim is not None
 
     return CModel(
         input_dim=input_dim,
@@ -253,5 +350,6 @@ def create_cmodel(
         output_dim=output_dim,
         output_ff_hidden_dim=latent_dim * output_ff_mult,
         pooling=pooling,
+        interval_encoder=interval_encoder,
         key=key,
     )

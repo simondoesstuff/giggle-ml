@@ -221,3 +221,109 @@ class TestCModel:
         model2 = create_cmodel(input_dim=32, latent_dim=64, key=jax.random.key(1))
 
         assert not jnp.allclose(model1.latents, model2.latents)
+
+
+class TestCModelWithIntervals:
+    """Tests for CModel with genomic interval encoding."""
+
+    def test_factory_with_seq_dim_creates_interval_encoder(self):
+        model = create_cmodel(
+            seq_dim=32,
+            latent_dim=64,
+            num_latents=8,
+            interval_chrm_dim=8,
+            interval_size_dim=8,
+            interval_center_dim=16,
+        )
+        assert model.interval_encoder is not None
+        assert model.interval_encoder.dim == 32  # 8 + 8 + 16
+
+    def test_input_dim_is_seq_dim_plus_interval_dim(self):
+        model = create_cmodel(
+            seq_dim=32,
+            latent_dim=64,
+            num_latents=8,
+            interval_chrm_dim=8,
+            interval_size_dim=8,
+            interval_center_dim=16,
+        )
+        # input_dim should be seq_dim + interval_dim = 32 + 32 = 64
+        assert model.input_ffn.in_size == 64
+
+    def test_forward_with_intervals(self):
+        model = create_cmodel(
+            seq_dim=32,
+            latent_dim=64,
+            num_latents=8,
+        )
+        seq_emb = jnp.ones((10, 32))
+        intervals = jnp.array([
+            [0, 1000, 2000],
+            [0, 2000, 3000],
+            [1, 3000, 4000],
+            [1, 4000, 5000],
+            [2, 5000, 6000],
+            [2, 6000, 7000],
+            [3, 7000, 8000],
+            [3, 8000, 9000],
+            [4, 9000, 10000],
+            [4, 10000, 11000],
+        ])
+        output = model(seq_emb, intervals)
+        assert output.shape == (64,)
+
+    def test_forward_without_intervals_uses_seq_directly(self):
+        # When no intervals, seq_embeddings should be used as input directly
+        model = create_cmodel(input_dim=32, latent_dim=64, num_latents=8)
+        seq_emb = jnp.ones((10, 32))
+        output = model(seq_emb)
+        assert output.shape == (64,)
+
+    def test_forward_features_bypasses_interval_encoding(self):
+        model = create_cmodel(
+            seq_dim=32,
+            latent_dim=64,
+            num_latents=8,
+        )
+        # forward_features should work with raw features of the right size
+        # input_dim = seq_dim (32) + interval_dim (64 default) = 96
+        raw_features = jnp.ones((10, 96))
+        output = model.forward_features(raw_features)
+        assert output.shape == (64,)
+
+    def test_intervals_without_encoder_raises(self):
+        model = create_cmodel(input_dim=32, latent_dim=64, num_latents=8)
+        seq_emb = jnp.ones((10, 32))
+        intervals = jnp.array([[0, 1000, 2000]] * 10)
+
+        with pytest.raises(ValueError, match="no interval_encoder configured"):
+            model(seq_emb, intervals)
+
+    def test_cannot_specify_both_input_dim_and_seq_dim(self):
+        with pytest.raises(ValueError, match="Specify either input_dim or seq_dim"):
+            create_cmodel(input_dim=32, seq_dim=32)
+
+    def test_jit_with_intervals(self):
+        model = create_cmodel(seq_dim=32, latent_dim=64, num_latents=8)
+        seq_emb = jnp.ones((10, 32))
+        intervals = jnp.array([[0, 1000 + i * 1000, 2000 + i * 1000] for i in range(10)])
+
+        jitted = eqx.filter_jit(model)
+        output = jitted(seq_emb, intervals)
+        assert output.shape == (64,)
+
+    def test_gradient_flow_with_intervals(self):
+        model = create_cmodel(seq_dim=32, latent_dim=64, num_latents=8)
+        seq_emb = jnp.ones((10, 32))
+        intervals = jnp.array([[0, 1000 + i * 1000, 2000 + i * 1000] for i in range(10)])
+
+        def loss_fn(m: CModel, s: jax.Array, iv: jax.Array) -> jax.Array:
+            return jnp.mean(m(s, iv) ** 2)
+
+        grads = eqx.filter_grad(loss_fn)(model, seq_emb, intervals)
+
+        # Check gradients exist for key parameters including interval encoder
+        assert grads.latents is not None
+        assert not jnp.allclose(grads.latents, 0)
+        assert grads.interval_encoder is not None
+        assert grads.interval_encoder.chrm_embedding.weight is not None
