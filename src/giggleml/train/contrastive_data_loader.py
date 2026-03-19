@@ -12,6 +12,7 @@ import zarr
 from jaxtyping import Array, BFloat16, Int, PRNGKeyArray
 from tqdm import tqdm
 
+from giggleml.data.contrastive_memmap import ContrastiveMemmapData
 from giggleml.data.intervals import load_bed_array
 from giggleml.train.similarity_graph.community_subgraph import (
     community_subgraph_iterator,
@@ -68,6 +69,8 @@ class ContrastiveDataLoader:
         max_intervals: Maximum intervals per file. Files exceeding this are
             randomly downsampled per-batch. None disables capping.
         preload: If True, load all BED files into cache on init. If False, load lazily.
+        memmap_dir: Optional directory containing pre-built memmap files.
+            If provided, loads from memmap instead of individual zarr/BED files.
     """
 
     graph: SimilarityGraph
@@ -78,6 +81,7 @@ class ContrastiveDataLoader:
     neighbors_per_anchor: int
     max_intervals: int | None
     _cache: dict[int, BedFileData]
+    _memmap: ContrastiveMemmapData | None
 
     def __init__(
         self,
@@ -90,6 +94,7 @@ class ContrastiveDataLoader:
         *,
         max_intervals: int | None = None,
         preload: bool = False,
+        memmap_dir: Pathish | None = None,
     ) -> None:
         self.graph = graph
         self.bed_names = sorted(bed_names)
@@ -99,6 +104,18 @@ class ContrastiveDataLoader:
         self.neighbors_per_anchor = neighbors_per_anchor
         self.max_intervals = max_intervals
         self._cache = {}
+
+        # Load memmap if provided
+        if memmap_dir is not None:
+            self._memmap = ContrastiveMemmapData(memmap_dir, mode="r")
+            # Validate bed_names match memmap ordering
+            if self._memmap.bed_names != self.bed_names:
+                raise ValueError(
+                    f"bed_names mismatch: memmap has {len(self._memmap.bed_names)} files, "
+                    f"expected {len(self.bed_names)} files with matching names"
+                )
+        else:
+            self._memmap = None
 
         if len(bed_names) != graph.n:
             raise ValueError(
@@ -110,22 +127,29 @@ class ContrastiveDataLoader:
 
     def _preload_all(self) -> None:
         """Load all BED files into cache."""
-        for idx in tqdm(range(len(self.bed_names)), desc="Preloading BED files"):
+        desc = "Preloading from memmap" if self._memmap else "Preloading BED files"
+        for idx in tqdm(range(len(self.bed_names)), desc=desc):
             if idx not in self._cache:
                 self._cache[idx] = self._load_bed_uncached(idx)
 
     def _load_bed_uncached(self, node_idx: int) -> BedFileData:
         """Load BED file data from disk (no cache check)."""
-        name = self.bed_names[node_idx]
+        if self._memmap is not None:
+            # Load from memmap (fast path)
+            embeddings = jnp.array(self._memmap.get_embeddings(node_idx))
+            intervals = jnp.array(self._memmap.get_intervals(node_idx))
+        else:
+            # Load from individual zarr/BED files
+            name = self.bed_names[node_idx]
 
-        # Load embeddings from zarr
-        zarr_path = self.embedding_dir / f"{name}.zarr"
-        zarr_array = zarr.open_array(zarr_path, mode="r")
-        embeddings = jnp.array(zarr_array[:], dtype=jnp.bfloat16)
+            # Load embeddings from zarr
+            zarr_path = self.embedding_dir / f"{name}.zarr"
+            zarr_array = zarr.open_array(zarr_path, mode="r")
+            embeddings = jnp.array(zarr_array[:], dtype=jnp.bfloat16)
 
-        # Load intervals from BED file
-        bed_path = self.bed_dir / f"{name}.bed"
-        intervals = load_bed_array(bed_path)
+            # Load intervals from BED file
+            bed_path = self.bed_dir / f"{name}.bed"
+            intervals = load_bed_array(bed_path)
 
         return BedFileData(
             node_idx=node_idx,

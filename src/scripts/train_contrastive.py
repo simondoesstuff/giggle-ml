@@ -25,6 +25,7 @@ BED_DIR = rme / "beds"
 EMBEDDING_DIR = rme / "embeds"
 SIMILARITY_MATRIX_PATH = rme / "giggle_similarity.mat"
 CHECKPOINT_DIR = Path("data/checkpoints/cmodel_2026-3-18")
+MEMMAP_DIR: Path | None = rme / "contrastive_memmap"
 
 # === Training Configuration ===
 CONFIG = ContrastiveTrainingConfig(
@@ -52,6 +53,7 @@ CONFIG = ContrastiveTrainingConfig(
     # Data paths (set from constants above)
     embedding_dir=EMBEDDING_DIR,
     bed_dir=BED_DIR,
+    memmap_dir=MEMMAP_DIR,
 )
 
 # === Random Seed ===

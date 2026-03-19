@@ -187,6 +187,7 @@ class ContrastiveTrainingConfig:
     # Data paths
     embedding_dir: Pathish = field(default_factory=lambda: Path("."))
     bed_dir: Pathish = field(default_factory=lambda: Path("."))
+    memmap_dir: Pathish | None = None
 
 
 # === Loss Function ===
@@ -480,6 +481,7 @@ def train(
         neighbors_per_anchor=config.neighbors_per_anchor,
         max_intervals=config.max_intervals,
         preload=False,
+        memmap_dir=config.memmap_dir,
     )
 
     # Sharding specs for batched data
