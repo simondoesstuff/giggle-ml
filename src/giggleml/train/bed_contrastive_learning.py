@@ -11,6 +11,8 @@ Architecture:
         BED-level embedding
             ↓
         Weighted InfoNCE Loss (edge types as weights)
+
+Training uses bf16 precision and data parallel sharding across all GPUs.
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from jaxtyping import Array, Float, Int, PRNGKeyArray
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+from jaxtyping import Array, BFloat16, Bool, Float, Int, PRNGKeyArray
 from tqdm import tqdm
 
 from giggleml.data.similarity_matrix import SimilarityMatrix
@@ -34,7 +38,89 @@ from giggleml.train.contrastive_data_loader import (
     ContrastiveDataLoader,
 )
 from giggleml.train.similarity_graph.similarity_graph import SimilarityGraph
+from giggleml.utils.equinox import save_checkpoint, to_bf16, to_f32
 from giggleml.utils.file_utils import Pathish
+
+# === Sharding Utilities ===
+
+
+def create_device_mesh() -> Mesh:
+    """Create a 1D device mesh across all available devices."""
+    devices = jax.devices()
+    return Mesh(np.array(devices), axis_names=("batch",))
+
+
+def replicated_sharding(mesh: Mesh) -> NamedSharding:
+    """Create sharding spec for replicated data (model params)."""
+    return NamedSharding(mesh, P())
+
+
+def batch_sharding(mesh: Mesh) -> NamedSharding:
+    """Create sharding spec for batch-sharded data."""
+    return NamedSharding(mesh, P("batch"))
+
+
+def shard_model(model: CModel, sharding: NamedSharding) -> CModel:
+    """Shard model arrays while preserving non-array leaves (functions, static fields)."""
+    arrays, non_arrays = eqx.partition(model, eqx.is_array)
+    arrays = jax.device_put(arrays, sharding)
+    return eqx.combine(arrays, non_arrays)
+
+
+# === Batch Padding Utilities ===
+
+
+def _next_power_of_two(n: int) -> int:
+    """Return the smallest power of two >= n."""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def pad_batch(
+    embeddings_list: list[Float[Array, "n edim"]],
+    intervals_list: list[Int[Array, "n 3"]],
+) -> tuple[
+    Float[Array, "batch pad_len edim"],
+    Int[Array, "batch pad_len 3"],
+    Bool[Array, "batch pad_len 2"],
+]:
+    """Pad variable-length BED data to next power-of-two length for batched processing.
+
+    Padding to powers of two enables better JIT cache reuse and allows XLA to
+    apply more automatic optimizations.
+
+    Args:
+        embeddings_list: List of embedding arrays, each (n_i, edim).
+        intervals_list: List of interval arrays, each (n_i, 3).
+
+    Returns:
+        Tuple of:
+        - Padded embeddings: (batch, pad_len, edim) where pad_len is next power of 2
+        - Padded intervals: (batch, pad_len, 3)
+        - Mask: (batch, pad_len, 2) where True = masked (padded position)
+    """
+    batch_size = len(embeddings_list)
+    max_len = max(emb.shape[0] for emb in embeddings_list)
+    pad_len = _next_power_of_two(max_len)
+    edim = embeddings_list[0].shape[1]
+
+    # Pre-allocate padded arrays at power-of-two length
+    padded_emb = jnp.zeros((batch_size, pad_len, edim), dtype=embeddings_list[0].dtype)
+    padded_ivs = jnp.zeros((batch_size, pad_len, 3), dtype=jnp.int32)
+    # Mask: True = masked/padded, starts all True
+    mask = jnp.ones((batch_size, pad_len, 2), dtype=bool)
+
+    # Fill in actual data and unmask valid positions
+    for i, (emb, ivs) in enumerate(zip(embeddings_list, intervals_list)):
+        n = emb.shape[0]
+        padded_emb = padded_emb.at[i, :n].set(emb)
+        padded_ivs = padded_ivs.at[i, :n].set(ivs)
+        # Unmask valid positions (both seq and interval are valid)
+        mask = mask.at[i, :n].set(False)
+
+    return padded_emb, padded_ivs, mask
+
 
 # === Configuration ===
 
@@ -65,6 +151,8 @@ class ContrastiveTrainingConfig:
 
         num_anchors: Number of anchor nodes to sample per batch.
         neighbors_per_anchor: Number of neighbors to sample per anchor.
+        max_intervals: Maximum intervals per BED file. Files exceeding this are
+            randomly downsampled per-batch. None disables capping.
 
         embedding_dir: Directory containing zarr arrays of HyenaDNA embeddings.
         bed_dir: Directory containing .bed.gz files.
@@ -94,6 +182,7 @@ class ContrastiveTrainingConfig:
     # Batch (community subgraph)
     num_anchors: int = 16
     neighbors_per_anchor: int = 4
+    max_intervals: int | None = None
 
     # Data paths
     embedding_dir: Pathish = field(default_factory=lambda: Path("."))
@@ -179,8 +268,96 @@ def create_optimizer(config: ContrastiveTrainingConfig) -> optax.GradientTransfo
     )
 
 
+def _single_forward(
+    model: CModel,
+    embeddings: Float[Array, "max_len edim"],
+    intervals: Int[Array, "max_len 3"],
+    mask: Bool[Array, "max_len 2"],
+    key: PRNGKeyArray,
+) -> Float[Array, "output_dim"]:
+    """Forward pass for a single BED file with checkpointing."""
+
+    @jax.checkpoint
+    def forward(
+        emb: Float[Array, "max_len edim"],
+        ivs: Int[Array, "max_len 3"],
+        m: Bool[Array, "max_len 2"],
+        k: PRNGKeyArray,
+    ) -> Float[Array, "output_dim"]:
+        return model(emb, ivs, mask=m, key=k)
+
+    return forward(embeddings, intervals, mask, key)
+
+
+def _batched_forward(
+    model: CModel,
+    embeddings: Float[Array, "batch max_len edim"],
+    intervals: Int[Array, "batch max_len 3"],
+    mask: Bool[Array, "batch max_len 2"],
+    keys: PRNGKeyArray,
+) -> Float[Array, "batch output_dim"]:
+    """Batched forward pass using vmap - processes all BED files in parallel."""
+    return jax.vmap(lambda emb, ivs, m, k: _single_forward(model, emb, ivs, m, k))(
+        embeddings, intervals, mask, keys
+    )
+
+
 @eqx.filter_jit
 def train_step(
+    model: CModel,
+    opt_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+    padded_embeddings: Float[Array, "batch max_len edim"],
+    padded_intervals: Int[Array, "batch max_len 3"],
+    mask: Bool[Array, "batch max_len 2"],
+    adjacency: Int[Array, "batch batch"],
+    edge_type_weights: Float[Array, "num_types"],
+    temperature: float,
+    key: PRNGKeyArray,
+) -> tuple[CModel, optax.OptState, Float[Array, ""]]:
+    """Perform a data-parallel training step with gradient checkpointing.
+
+    When inputs are sharded across devices (via device_put with batch_sharding),
+    computation is automatically distributed. Each device processes its portion
+    of the batch, then embeddings are all-gathered for pairwise loss computation.
+
+    Args:
+        model: CModel to train (bf16 weights, replicated across devices).
+        opt_state: Optimizer state (replicated).
+        optimizer: Optax optimizer.
+        padded_embeddings: Padded embeddings (batch, max_len, edim), sharded on batch.
+        padded_intervals: Padded intervals (batch, max_len, 3), sharded on batch.
+        mask: Padding mask (batch, max_len, 2), sharded on batch. True = masked.
+        adjacency: Adjacency matrix (batch, batch), replicated.
+        edge_type_weights: Edge type weights, replicated.
+        temperature: InfoNCE temperature.
+        key: PRNG key for dropout.
+
+    Returns:
+        Tuple of (updated_model, updated_opt_state, loss).
+    """
+    batch_size = padded_embeddings.shape[0]
+    dropout_keys = jax.random.split(key, batch_size)
+
+    def loss_fn(model: CModel) -> Float[Array, ""]:
+        # Forward pass - vmap over batch, sharding distributes across devices
+        batch_embeddings = _batched_forward(
+            model, padded_embeddings, padded_intervals, mask, dropout_keys
+        )
+        # Cast to f32 for stable loss computation
+        batch_embeddings_f32 = batch_embeddings.astype(jnp.float32)
+        return weighted_infonce_loss(
+            batch_embeddings_f32, adjacency, edge_type_weights, temperature
+        )
+
+    loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
+    updates, opt_state = optimizer.update(grads, opt_state, model)  # pyright: ignore[reportArgumentType]
+    model = eqx.apply_updates(model, updates)
+
+    return model, opt_state, loss
+
+
+def train_step_unpadded(
     model: CModel,
     opt_state: optax.OptState,
     optimizer: optax.GradientTransformation,
@@ -191,48 +368,28 @@ def train_step(
     temperature: float,
     key: PRNGKeyArray,
 ) -> tuple[CModel, optax.OptState, Float[Array, ""]]:
-    """Perform a single training step.
+    """Convenience wrapper that pads inputs before calling train_step.
 
-    Args:
-        model: CModel to train.
-        opt_state: Optimizer state.
-        optimizer: Optax optimizer.
-        embeddings_batch: List of embedding arrays for each BED file in batch.
-        intervals_batch: List of interval arrays for each BED file in batch.
-        adjacency: Adjacency matrix with edge types.
-        edge_type_weights: Weight for each edge type.
-        temperature: InfoNCE temperature.
-        key: PRNG key for dropout.
-
-    Returns:
-        Tuple of (updated_model, updated_opt_state, loss).
+    For testing or when inputs aren't pre-padded.
     """
-    # Split keys for each sample in batch
-    batch_size = len(embeddings_batch)
-    dropout_keys = jax.random.split(key, batch_size)
-
-    def loss_fn(model: CModel) -> Float[Array, ""]:
-        # Process each BED file through CModel with dropout
-        batch_embeddings = jnp.stack(
-            [
-                model(emb, ivs, key=k)
-                for emb, ivs, k in zip(embeddings_batch, intervals_batch, dropout_keys)
-            ]
-        )
-        return weighted_infonce_loss(
-            batch_embeddings, adjacency, edge_type_weights, temperature
-        )
-
-    loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-    updates, opt_state = optimizer.update(grads, opt_state, model)  # pyright: ignore[reportArgumentType]
-    model = eqx.apply_updates(model, updates)
-
-    return model, opt_state, loss
+    padded_emb, padded_ivs, mask = pad_batch(embeddings_batch, intervals_batch)
+    return train_step(
+        model,
+        opt_state,
+        optimizer,
+        padded_emb,
+        padded_ivs,
+        mask,
+        adjacency,
+        edge_type_weights,
+        temperature,
+        key,
+    )
 
 
 def _extract_batch_data(
     batch: ContrastiveBatch,
-) -> tuple[list[Float[Array, "n edim"]], list[Int[Array, "n 3"]]]:
+) -> tuple[list[BFloat16[Array, "n edim"]], list[Int[Array, "n 3"]]]:
     """Extract embeddings and intervals lists from batch (for JIT compatibility)."""
     embeddings = [bd.embeddings for bd in batch.bed_data]
     intervals = [bd.intervals for bd in batch.bed_data]
@@ -249,7 +406,10 @@ def train(
     checkpoint_every: int | None = None,
     checkpoint_dir: Path | None = None,
 ) -> CModel:
-    """Train CModel with contrastive learning.
+    """Train CModel with contrastive learning using bf16 and data parallelism.
+
+    Uses bfloat16 precision for forward/backward passes and replicates the model
+    across all available devices for data parallel training.
 
     Args:
         config: Training configuration.
@@ -262,9 +422,15 @@ def train(
         checkpoint_dir: Directory to save checkpoints (required if checkpoint_every is set).
 
     Returns:
-        Trained CModel.
+        Trained CModel (in f32).
     """
     key, model_key, data_key, train_key = jax.random.split(key, 4)
+
+    # Set up device mesh for data parallelism
+    mesh = create_device_mesh()
+    replicate = replicated_sharding(mesh)
+    num_devices = len(jax.devices())
+    print(f"Training with {num_devices} device(s), bf16 precision")
 
     # Build similarity graph from matrix + config thresholds
     graph = SimilarityGraph(
@@ -291,12 +457,18 @@ def train(
     trainable_params = sum(x.size for x in jax.tree_util.tree_leaves(trainable_parts))
     print(f"Built CModel, Trainable parameters: {trainable_params:,}")
 
-    # Create optimizer
+    # Convert model to bf16 and replicate across devices
+    model = to_bf16(model)
+    model = shard_model(model, replicate)
+
+    # Create optimizer (operates on bf16 params)
     optimizer = create_optimizer(config)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    opt_state = jax.device_put(opt_state, replicate)
 
-    # Edge type weights from config
+    # Edge type weights (replicated)
     edge_type_weights = jnp.array(config.bin_weights, dtype=jnp.float32)
+    edge_type_weights = jax.device_put(edge_type_weights, replicate)
 
     # Create data loader
     data_loader = ContrastiveDataLoader(
@@ -306,8 +478,12 @@ def train(
         bed_dir=config.bed_dir,
         num_anchors=config.num_anchors,
         neighbors_per_anchor=config.neighbors_per_anchor,
+        max_intervals=config.max_intervals,
         preload=False,
     )
+
+    # Sharding specs for batched data
+    batch_shard = batch_sharding(mesh)
 
     # Training loop
     batch_iter = data_loader.iter_batches(data_key)
@@ -317,13 +493,23 @@ def train(
         batch = next(batch_iter)
         embeddings_batch, intervals_batch = _extract_batch_data(batch)
 
+        # Pad to uniform length and shard across devices
+        padded_emb, padded_ivs, mask = pad_batch(embeddings_batch, intervals_batch)
+        padded_emb = jax.device_put(padded_emb, batch_shard)
+        padded_ivs = jax.device_put(padded_ivs, batch_shard)
+        mask = jax.device_put(mask, batch_shard)
+
+        # Adjacency stays replicated (needed for full pairwise loss)
+        adjacency = jax.device_put(batch.adjacency, replicate)
+
         model, opt_state, loss = train_step(
             model,
             opt_state,
             optimizer,
-            embeddings_batch,
-            intervals_batch,
-            batch.adjacency,
+            padded_emb,
+            padded_ivs,
+            mask,
+            adjacency,
             edge_type_weights,
             config.temperature,
             step_key,
@@ -334,40 +520,16 @@ def train(
 
         if checkpoint_every and checkpoint_dir and (step + 1) % checkpoint_every == 0:
             ckpt_path = checkpoint_dir / f"model_step_{step + 1}.eqx"
-            save_checkpoint(model, ckpt_path)
+            # Convert back to f32 for checkpointing
+            save_checkpoint(to_f32(model), ckpt_path)
             tqdm.write(f"Saved checkpoint: {ckpt_path}")
 
-    # Save final checkpoint
+    # Save final checkpoint (in f32)
     if checkpoint_dir:
         final_path = checkpoint_dir / f"model_step_{config.total_steps}.eqx"
         if not final_path.exists():
-            save_checkpoint(model, final_path)
+            save_checkpoint(to_f32(model), final_path)
             tqdm.write(f"Saved final checkpoint: {final_path}")
 
-    return model
-
-
-# === Checkpointing ===
-
-
-def save_checkpoint(model: CModel, path: Path) -> None:
-    """Save model checkpoint to disk.
-
-    Args:
-        model: CModel to save.
-        path: Path to save checkpoint.
-    """
-    eqx.tree_serialise_leaves(path, model)
-
-
-def load_checkpoint(path: Path, model_template: CModel) -> CModel:
-    """Load model checkpoint from disk.
-
-    Args:
-        path: Path to checkpoint file.
-        model_template: Model with same structure as saved model (for deserialization).
-
-    Returns:
-        Loaded CModel.
-    """
-    return eqx.tree_deserialise_leaves(path, model_template)
+    # Return model in f32
+    return to_f32(model)

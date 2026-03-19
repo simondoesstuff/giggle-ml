@@ -46,8 +46,9 @@ CONFIG = ContrastiveTrainingConfig(
     bin_thresholds=(10, 20, 30, 40),
     bin_weights=(0.2, 0.4, 0.6, 0.8, 1.0),
     # Batch sampling
-    num_anchors=4,
-    neighbors_per_anchor=4,
+    num_anchors=2,
+    neighbors_per_anchor=1,
+    max_intervals=10_000,
     # Data paths (set from constants above)
     embedding_dir=EMBEDDING_DIR,
     bed_dir=BED_DIR,

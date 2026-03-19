@@ -6,9 +6,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import zarr
-from jaxtyping import Array, Float, Int, PRNGKeyArray
+from jaxtyping import Array, BFloat16, Int, PRNGKeyArray
 from tqdm import tqdm
 
 from giggleml.data.intervals import load_bed_array
@@ -30,7 +31,7 @@ class BedFileData:
     """
 
     node_idx: int
-    embeddings: Float[Array, "n edim"]
+    embeddings: BFloat16[Array, "n edim"]
     intervals: Int[Array, "n 3"]
 
 
@@ -64,6 +65,8 @@ class ContrastiveDataLoader:
         bed_dir: Directory containing .bed files.
         num_anchors: Number of anchor nodes per batch.
         neighbors_per_anchor: Number of neighbors per anchor.
+        max_intervals: Maximum intervals per file. Files exceeding this are
+            randomly downsampled per-batch. None disables capping.
         preload: If True, load all BED files into cache on init. If False, load lazily.
     """
 
@@ -73,6 +76,7 @@ class ContrastiveDataLoader:
     bed_dir: Path
     num_anchors: int
     neighbors_per_anchor: int
+    max_intervals: int | None
     _cache: dict[int, BedFileData]
 
     def __init__(
@@ -84,6 +88,7 @@ class ContrastiveDataLoader:
         num_anchors: int,
         neighbors_per_anchor: int,
         *,
+        max_intervals: int | None = None,
         preload: bool = False,
     ) -> None:
         self.graph = graph
@@ -92,6 +97,7 @@ class ContrastiveDataLoader:
         self.bed_dir = Path(bed_dir)
         self.num_anchors = num_anchors
         self.neighbors_per_anchor = neighbors_per_anchor
+        self.max_intervals = max_intervals
         self._cache = {}
 
         if len(bed_names) != graph.n:
@@ -115,7 +121,7 @@ class ContrastiveDataLoader:
         # Load embeddings from zarr
         zarr_path = self.embedding_dir / f"{name}.zarr"
         zarr_array = zarr.open_array(zarr_path, mode="r")
-        embeddings = jnp.array(zarr_array[:])
+        embeddings = jnp.array(zarr_array[:], dtype=jnp.bfloat16)
 
         # Load intervals from BED file
         bed_path = self.bed_dir / f"{name}.bed"
@@ -141,6 +147,20 @@ class ContrastiveDataLoader:
         """Clear the in-memory cache."""
         self._cache.clear()
 
+    def _downsample(self, data: BedFileData, key: PRNGKeyArray) -> BedFileData:
+        """Downsample a BedFileData to max_intervals if it exceeds the cap."""
+        n = data.embeddings.shape[0]
+        if self.max_intervals is None or n <= self.max_intervals:
+            return data
+
+        indices = jax.random.choice(key, n, shape=(self.max_intervals,), replace=False)
+
+        return BedFileData(
+            node_idx=data.node_idx,
+            embeddings=data.embeddings[indices],
+            intervals=data.intervals[indices],
+        )
+
     def iter_batches(self, key: PRNGKeyArray) -> Iterator[ContrastiveBatch]:
         """Iterate over batches of community subgraphs.
 
@@ -150,8 +170,13 @@ class ContrastiveDataLoader:
         Yields:
             ContrastiveBatch objects containing BED data and adjacency matrix.
         """
+        key, subgraph_key = jax.random.split(key)
         for node_indices, adjacency in community_subgraph_iterator(
-            self.graph, self.num_anchors, self.neighbors_per_anchor, key=key
+            self.graph, self.num_anchors, self.neighbors_per_anchor, key=subgraph_key
         ):
-            bed_data = [self._load_bed(int(idx)) for idx in node_indices]
+            key, *file_keys = jax.random.split(key, len(node_indices) + 1)
+            bed_data = [
+                self._downsample(self._load_bed(int(idx)), file_keys[i])
+                for i, idx in enumerate(node_indices)
+            ]
             yield ContrastiveBatch(bed_data, jnp.array(adjacency))
