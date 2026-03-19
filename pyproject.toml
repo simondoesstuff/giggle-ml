@@ -47,6 +47,7 @@ reportUnknownArgumentType = false
 reportUnknownVariableType = false
 reportUnusedCallResult = false
 reportMissingTypeArgument = false
+reportUnknownLambdaType = false
 # executionEnvironments = [
 # { root = "src" },
 # { root = "tests", extraPaths = ["src"] }
