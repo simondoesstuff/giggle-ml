@@ -92,19 +92,16 @@ def main() -> None:
     print(f"Embedding dimension: {memmap.metadata.embedding_dim}")
 
     # File sizes
-    embeddings_path = output_dir / "embeddings.mmap"
-    intervals_path = output_dir / "intervals.mmap"
+    data_path = output_dir / "data.mmap"
     metadata_path = output_dir / "metadata.json"
 
-    emb_size = embeddings_path.stat().st_size
-    ivs_size = intervals_path.stat().st_size
+    data_size = data_path.stat().st_size
     meta_size = metadata_path.stat().st_size
-    total_size = emb_size + ivs_size + meta_size
+    total_size = data_size + meta_size
 
     print()
     print("=== File Sizes ===")
-    print(f"Embeddings: {format_size(emb_size)}")
-    print(f"Intervals:  {format_size(ivs_size)}")
+    print(f"Data:       {format_size(data_size)}")
     print(f"Metadata:   {format_size(meta_size)}")
     print(f"Total:      {format_size(total_size)}")
 

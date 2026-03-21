@@ -98,8 +98,7 @@ class TestContrastiveMemmapData:
         )
 
         # Verify files were created
-        assert (output_dir / "embeddings.mmap").exists()
-        assert (output_dir / "intervals.mmap").exists()
+        assert (output_dir / "data.mmap").exists()
         assert (output_dir / "metadata.json").exists()
 
         # Verify metadata

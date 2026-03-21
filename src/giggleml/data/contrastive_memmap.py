@@ -26,9 +26,8 @@ _bf16_dtype = ml_dtypes.bfloat16
 type MemMapMode = Literal["r", "w+"]
 
 METADATA_FILENAME = "metadata.json"
-EMBEDDINGS_FILENAME = "embeddings.mmap"
-INTERVALS_FILENAME = "intervals.mmap"
-CURRENT_VERSION = 1
+DATA_FILENAME = "data.mmap"
+CURRENT_VERSION = 2
 
 
 @dataclass
@@ -40,6 +39,7 @@ class ContrastiveMemmapMetadata:
         embedding_dim: Dimension of embeddings.
         total_intervals: Total number of intervals across all files.
         num_files: Number of BED files stored.
+        intervals_byte_offset: Byte offset where intervals data starts in data.mmap.
         bed_names: Sorted list of BED file names (without extensions).
         offsets: Start index for each file in the memmap arrays.
         lengths: Number of intervals per file.
@@ -49,6 +49,7 @@ class ContrastiveMemmapMetadata:
     embedding_dim: int
     total_intervals: int
     num_files: int
+    intervals_byte_offset: int = 0
     bed_names: list[str] = field(default_factory=list)
     offsets: list[int] = field(default_factory=list)
     lengths: list[int] = field(default_factory=list)
@@ -60,6 +61,7 @@ class ContrastiveMemmapMetadata:
             "embedding_dim": self.embedding_dim,
             "total_intervals": self.total_intervals,
             "num_files": self.num_files,
+            "intervals_byte_offset": self.intervals_byte_offset,
             "bed_names": self.bed_names,
             "offsets": self.offsets,
             "lengths": self.lengths,
@@ -73,6 +75,7 @@ class ContrastiveMemmapMetadata:
             embedding_dim=int(data["embedding_dim"]),  # pyright: ignore[reportArgumentType]
             total_intervals=int(data["total_intervals"]),  # pyright: ignore[reportArgumentType]
             num_files=int(data["num_files"]),  # pyright: ignore[reportArgumentType]
+            intervals_byte_offset=int(data["intervals_byte_offset"]),  # pyright: ignore[reportArgumentType]
             bed_names=list(data["bed_names"]),  # pyright: ignore[reportArgumentType]
             offsets=list(data["offsets"]),  # pyright: ignore[reportArgumentType]
             lengths=list(data["lengths"]),  # pyright: ignore[reportArgumentType]
@@ -82,14 +85,18 @@ class ContrastiveMemmapMetadata:
 class ContrastiveMemmapData:
     """Memory-mapped storage for contrastive learning embeddings and intervals.
 
-    Stores consolidated data from multiple zarr/BED files in two memory-mapped
-    files with a JSON metadata file for offsets and ordering.
+    Stores consolidated data from multiple zarr/BED files in a single memory-mapped
+    file with a JSON metadata file for offsets and ordering. Using a single file
+    allows faster preloading via one contiguous read.
 
     File structure:
         memmap_dir/
-            embeddings.mmap  # bfloat16, shape: (total_intervals, embedding_dim)
-            intervals.mmap   # int32, shape: (total_intervals, 3)
-            metadata.json    # Offsets, lengths, bed_names ordering
+            data.mmap      # embeddings (bfloat16) followed by intervals (int32)
+            metadata.json  # Offsets, lengths, bed_names ordering, byte offsets
+
+    Layout of data.mmap:
+        [0, intervals_byte_offset): embeddings as bfloat16, shape (total_intervals, embedding_dim)
+        [intervals_byte_offset, end): intervals as int32, shape (total_intervals, 3)
 
     Args:
         memmap_dir: Directory containing the memmap files.
@@ -98,8 +105,8 @@ class ContrastiveMemmapData:
 
     _dir: Path
     _metadata: ContrastiveMemmapMetadata
-    _embeddings: np.memmap
-    _intervals: np.memmap
+    _embeddings: NDArray[np.floating]
+    _intervals: NDArray[np.int32]
 
     def __init__(
         self,
@@ -112,17 +119,24 @@ class ContrastiveMemmapData:
         if mode == "r":
             # Load existing memmap
             self._metadata = self._load_metadata()
-            self._embeddings = np.memmap(
-                self._dir / EMBEDDINGS_FILENAME,
-                dtype=_bf16_dtype,
-                mode="r",
-                shape=(self._metadata.total_intervals, self._metadata.embedding_dim),
+
+            # Load the unified data file
+            data_path = self._dir / DATA_FILENAME
+            total_bytes = data_path.stat().st_size
+
+            # Memory-map the whole file as bytes
+            raw_mmap = np.memmap(data_path, dtype=np.uint8, mode="r", shape=(total_bytes,))
+
+            # Create views into embeddings and intervals sections
+            emb_bytes = self._metadata.intervals_byte_offset
+            emb_shape = (self._metadata.total_intervals, self._metadata.embedding_dim)
+            self._embeddings = np.ndarray(
+                emb_shape, dtype=_bf16_dtype, buffer=raw_mmap[:emb_bytes]
             )
-            self._intervals = np.memmap(
-                self._dir / INTERVALS_FILENAME,
-                dtype=np.int32,
-                mode="r",
-                shape=(self._metadata.total_intervals, 3),
+
+            ivs_shape = (self._metadata.total_intervals, 3)
+            self._intervals = np.ndarray(
+                ivs_shape, dtype=np.int32, buffer=raw_mmap[emb_bytes:]
             )
         else:
             # Will be populated by build_from_files
@@ -137,7 +151,14 @@ class ContrastiveMemmapData:
         """Load metadata from JSON file."""
         metadata_path = self._dir / METADATA_FILENAME
         with open(metadata_path) as f:
-            return ContrastiveMemmapMetadata.from_dict(json.load(f))
+            data = json.load(f)
+        version = data.get("version", 0)
+        if version != CURRENT_VERSION:
+            raise ValueError(
+                f"Memmap version mismatch: found v{version}, expected v{CURRENT_VERSION}. "
+                f"Please rebuild the memmap with build_contrastive_memmap.py"
+            )
+        return ContrastiveMemmapMetadata.from_dict(data)
 
     def _save_metadata(self) -> None:
         """Save metadata to JSON file."""
@@ -236,29 +257,39 @@ class ContrastiveMemmapData:
         for length in lengths[:-1]:
             offsets.append(offsets[-1] + length)
 
+        # Compute byte layout: embeddings first, then intervals
+        # bfloat16 = 2 bytes per element
+        embeddings_bytes = total_intervals * embedding_dim * 2
+        # int32 = 4 bytes per element, 3 columns
+        intervals_bytes = total_intervals * 3 * 4
+        total_data_bytes = embeddings_bytes + intervals_bytes
+
         # Create metadata
         metadata = ContrastiveMemmapMetadata(
             version=CURRENT_VERSION,
             embedding_dim=embedding_dim,
             total_intervals=total_intervals,
             num_files=len(sorted_names),
+            intervals_byte_offset=embeddings_bytes,
             bed_names=sorted_names,
             offsets=offsets,
             lengths=lengths,
         )
 
-        # Create memmap files
-        embeddings_mmap = np.memmap(
-            output_dir / EMBEDDINGS_FILENAME,
+        # Create single unified memmap file
+        data_path = output_dir / DATA_FILENAME
+        raw_mmap = np.memmap(data_path, dtype=np.uint8, mode="w+", shape=(total_data_bytes,))
+
+        # Create views for writing
+        embeddings_view = np.ndarray(
+            (total_intervals, embedding_dim),
             dtype=_bf16_dtype,
-            mode="w+",
-            shape=(total_intervals, embedding_dim),
+            buffer=raw_mmap[:embeddings_bytes],
         )
-        intervals_mmap = np.memmap(
-            output_dir / INTERVALS_FILENAME,
+        intervals_view = np.ndarray(
+            (total_intervals, 3),
             dtype=np.int32,
-            mode="w+",
-            shape=(total_intervals, 3),
+            buffer=raw_mmap[embeddings_bytes:],
         )
 
         # Second pass: write data
@@ -270,22 +301,21 @@ class ContrastiveMemmapData:
             zarr_path = embedding_dir / f"{name}.zarr"
             zarr_array = zarr.open_array(zarr_path, mode="r")
             embeddings = np.asarray(zarr_array[:], dtype=_bf16_dtype)
-            embeddings_mmap[offset : offset + length] = embeddings
+            embeddings_view[offset : offset + length] = embeddings
 
             # Load intervals from BED file
             bed_path = bed_dir / f"{name}.bed"
             intervals = np.array(load_bed_array(bed_path), dtype=np.int32)
-            intervals_mmap[offset : offset + length] = intervals
+            intervals_view[offset : offset + length] = intervals
 
         # Flush to disk
-        embeddings_mmap.flush()
-        intervals_mmap.flush()
+        raw_mmap.flush()
 
         # Save metadata
         memmap_data = ContrastiveMemmapData(output_dir, mode="w+")
         memmap_data._metadata = metadata
-        memmap_data._embeddings = embeddings_mmap
-        memmap_data._intervals = intervals_mmap
+        memmap_data._embeddings = embeddings_view
+        memmap_data._intervals = intervals_view
         memmap_data._save_metadata()
 
         tqdm.write(f"Built memmap: {total_intervals:,} intervals from {len(sorted_names)} files")
