@@ -1,8 +1,8 @@
 import gzip as gzip_module
 from collections.abc import Iterable, Iterator, Sequence
 
-import jax.numpy as jnp
-from jaxtyping import Array, Int
+import numpy as np
+from numpy.typing import NDArray
 
 from giggleml.types import GenomicInterval
 from giggleml.utils.file_utils import Pathish, file_ext
@@ -60,7 +60,7 @@ def load_bed(path: Pathish, *, gzip: bool | None = None) -> Iterator[GenomicInte
 def interval_to_array(
     interval: GenomicInterval,
     chromosomes: Sequence[str] = DEFAULT_CHROMOSOMES,
-) -> Int[Array, "3"]:
+) -> NDArray[np.int32]:
     """Convert a GenomicInterval to an array [chrom_idx, start, end].
 
     Args:
@@ -72,7 +72,7 @@ def interval_to_array(
     """
     chrom, start, end = interval
     chrom_idx = chromosomes.index(chrom)
-    return jnp.array([chrom_idx, start, end], dtype=jnp.int32)
+    return np.array([chrom_idx, start, end], dtype=np.int32)
 
 
 def load_bed_array(
@@ -80,8 +80,8 @@ def load_bed_array(
     *,
     gzip: bool | None = None,
     chromosomes: Sequence[str] = DEFAULT_CHROMOSOMES,
-) -> Int[Array, "intervals 3"]:
-    """Load genomic intervals from a BED file as an array.
+) -> NDArray[np.int32]:
+    """Load genomic intervals from a BED file as a numpy array.
 
     Args:
         path: Path to the BED file (.bed or .gz compressed).
@@ -89,14 +89,12 @@ def load_bed_array(
         chromosomes: Sequence mapping chromosome index to name.
 
     Returns:
-        Array of shape (intervals, 3) with columns [chrom_idx, start, end].
+        Numpy array of shape (intervals, 3) with columns [chrom_idx, start, end].
     """
-    # Optimized for JAX: Build a standard Python list of lists first,
-    # then cast to a JAX array once to minimize accelerator overhead.
     raw_intervals = [
         [chromosomes.index(iv[0]), iv[1], iv[2]] for iv in load_bed(path, gzip=gzip)
     ]
-    return jnp.array(raw_intervals, dtype=jnp.int32)
+    return np.array(raw_intervals, dtype=np.int32)
 
 
 def sorted_by_size(

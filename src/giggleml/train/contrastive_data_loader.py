@@ -7,9 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
+import ml_dtypes
+import numpy as np
 import zarr
-from jaxtyping import Array, BFloat16, Int, PRNGKeyArray
+from jaxtyping import PRNGKeyArray
+from numpy.typing import NDArray
+
+# Type alias for numpy arrays in host memory
+type HostArray = NDArray[np.generic]
 from tqdm import tqdm
 
 from giggleml.data.contrastive_memmap import ContrastiveMemmapData
@@ -25,6 +30,9 @@ from giggleml.utils.file_utils import Pathish
 class BedFileData:
     """Container for a single BED file's data.
 
+    Data is stored as numpy arrays in host memory to minimize VRAM usage.
+    Conversion to JAX arrays happens at batch time.
+
     Attributes:
         node_idx: Index of this file in the similarity graph.
         embeddings: HyenaDNA embeddings of shape (n_intervals, embedding_dim).
@@ -32,13 +40,16 @@ class BedFileData:
     """
 
     node_idx: int
-    embeddings: BFloat16[Array, "n edim"]
-    intervals: Int[Array, "n 3"]
+    embeddings: HostArray
+    intervals: HostArray
 
 
 @dataclass(frozen=True)
 class ContrastiveBatch:
     """Batch of BED files with adjacency information.
+
+    All data is stored as numpy arrays in host memory. Transfer to device
+    happens in the training loop via jax.device_put.
 
     Attributes:
         bed_data: List of BedFileData objects for this batch.
@@ -47,7 +58,7 @@ class ContrastiveBatch:
     """
 
     bed_data: list[BedFileData]
-    adjacency: Int[Array, "batch batch"]
+    adjacency: NDArray[np.int32]
 
 
 class ContrastiveDataLoader:
@@ -133,21 +144,25 @@ class ContrastiveDataLoader:
                 self._cache[idx] = self._load_bed_uncached(idx)
 
     def _load_bed_uncached(self, node_idx: int) -> BedFileData:
-        """Load BED file data from disk (no cache check)."""
+        """Load BED file data from disk (no cache check).
+
+        Data is kept as numpy arrays in host memory. Conversion to JAX
+        arrays happens at batch time in pad_batch to minimize VRAM usage.
+        """
         if self._memmap is not None:
-            # Load from memmap (fast path)
-            embeddings = jnp.array(self._memmap.get_embeddings(node_idx))
-            intervals = jnp.array(self._memmap.get_intervals(node_idx))
+            # Load from memmap - copy slice to contiguous numpy array
+            embeddings = np.array(self._memmap.get_embeddings(node_idx))
+            intervals = np.array(self._memmap.get_intervals(node_idx))
         else:
             # Load from individual zarr/BED files
             name = self.bed_names[node_idx]
 
-            # Load embeddings from zarr
+            # Load embeddings from zarr as numpy
             zarr_path = self.embedding_dir / f"{name}.zarr"
             zarr_array = zarr.open_array(zarr_path, mode="r")
-            embeddings = jnp.array(zarr_array[:], dtype=jnp.bfloat16)
+            embeddings = np.asarray(zarr_array[:], dtype=ml_dtypes.bfloat16)
 
-            # Load intervals from BED file
+            # Load intervals from BED file (already numpy)
             bed_path = self.bed_dir / f"{name}.bed"
             intervals = load_bed_array(bed_path)
 
@@ -172,12 +187,19 @@ class ContrastiveDataLoader:
         self._cache.clear()
 
     def _downsample(self, data: BedFileData, key: PRNGKeyArray) -> BedFileData:
-        """Downsample a BedFileData to max_intervals if it exceeds the cap."""
+        """Downsample a BedFileData to max_intervals if it exceeds the cap.
+
+        Downsampling is deterministic: the same JAX key produces the same sample.
+        """
         n = data.embeddings.shape[0]
         if self.max_intervals is None or n <= self.max_intervals:
             return data
 
-        indices = jax.random.choice(key, n, shape=(self.max_intervals,), replace=False)
+        # Deterministic seed from JAX key - use full key data as numpy RNG seed
+        # This ensures reproducibility: same key -> same sample
+        seed = np.asarray(jax.random.key_data(key))
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(n, size=self.max_intervals, replace=False)
 
         return BedFileData(
             node_idx=data.node_idx,
@@ -203,4 +225,4 @@ class ContrastiveDataLoader:
                 self._downsample(self._load_bed(int(idx)), file_keys[i])
                 for i, idx in enumerate(node_indices)
             ]
-            yield ContrastiveBatch(bed_data, jnp.array(adjacency))
+            yield ContrastiveBatch(bed_data, np.asarray(adjacency, dtype=np.int32))

@@ -31,7 +31,7 @@ MEMMAP_DIR: Path | None = rme / "contrastive_memmap"
 CONFIG = ContrastiveTrainingConfig(
     # Model architecture
     seq_dim=128,  # HyenaDNA tiny embedding dim
-    latent_dim=128,
+    latent_dim=512,
     num_latents=8,
     shared_per_stack=1,
     num_stacks=4,
@@ -48,8 +48,8 @@ CONFIG = ContrastiveTrainingConfig(
     bin_weights=(0.2, 0.4, 0.6, 0.8, 1.0),
     # Batch sampling: batch size is (anchors * (neighbors + 1))
     num_anchors=16,
-    neighbors_per_anchor=7,
-    max_intervals=50_000,
+    neighbors_per_anchor=4 - 1,
+    max_intervals=30_000,
     # Data paths (set from constants above)
     embedding_dir=EMBEDDING_DIR,
     bed_dir=BED_DIR,

@@ -17,6 +17,7 @@ Training uses bf16 precision and data parallel sharding across all GPUs.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,7 +29,8 @@ import numpy as np
 import optax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, BFloat16, Bool, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from numpy.typing import NDArray
 from tqdm import tqdm
 
 from giggleml.data.similarity_matrix import SimilarityMatrix
@@ -83,28 +85,32 @@ def _pad_to_multiple(n: int, divisor: int) -> int:
 
 
 def pad_batch(
-    embeddings_list: list[Float[Array, "n edim"]],
-    intervals_list: list[Int[Array, "n 3"]],
+    embeddings_list: Sequence[NDArray[np.generic]],
+    intervals_list: Sequence[NDArray[np.generic]],
     num_devices: int = 1,
 ) -> tuple[
-    Float[Array, "batch pad_len edim"],
-    Int[Array, "batch pad_len 3"],
-    Bool[Array, "batch pad_len 2"],
+    NDArray[np.generic],
+    NDArray[np.int32],
+    NDArray[np.bool_],
 ]:
     """Pad variable-length BED data to next power-of-two length for batched processing.
+
+    Takes numpy arrays (host memory) and returns numpy arrays. Caller should use
+    jax.device_put() to transfer to device with appropriate sharding - this allows
+    a single host->device transfer without intermediate GPU allocations.
 
     Padding to powers of two enables better JIT cache reuse and allows XLA to
     apply more automatic optimizations. Batch dimension is padded to be divisible
     by num_devices for sharding.
 
     Args:
-        embeddings_list: List of embedding arrays, each (n_i, edim).
-        intervals_list: List of interval arrays, each (n_i, 3).
+        embeddings_list: List of numpy embedding arrays, each (n_i, edim).
+        intervals_list: List of numpy interval arrays, each (n_i, 3).
         num_devices: Number of devices for batch sharding. Batch size will be
             padded to a multiple of this.
 
     Returns:
-        Tuple of:
+        Tuple of numpy arrays (caller transfers to device):
         - Padded embeddings: (batch, pad_len, edim) where pad_len is next power of 2
         - Padded intervals: (batch, pad_len, 3)
         - Mask: (batch, pad_len, 2) where True = masked (padded position)
@@ -115,37 +121,37 @@ def pad_batch(
     pad_len = _next_power_of_two(max_len)
     edim = embeddings_list[0].shape[1]
 
-    # Pre-allocate padded arrays at power-of-two length
-    padded_emb = jnp.zeros((batch_size, pad_len, edim), dtype=embeddings_list[0].dtype)
-    padded_ivs = jnp.zeros((batch_size, pad_len, 3), dtype=jnp.int32)
+    # Build padded arrays in numpy (CPU) - caller transfers to device
+    padded_emb = np.zeros((batch_size, pad_len, edim), dtype=embeddings_list[0].dtype)
+    padded_ivs = np.zeros((batch_size, pad_len, 3), dtype=np.int32)
     # Mask: True = masked/padded, starts all True
-    mask = jnp.ones((batch_size, pad_len, 2), dtype=bool)
+    mask = np.ones((batch_size, pad_len, 2), dtype=np.bool_)
 
     # Fill in actual data and unmask valid positions
     for i, (emb, ivs) in enumerate(zip(embeddings_list, intervals_list)):
         n = emb.shape[0]
-        padded_emb = padded_emb.at[i, :n].set(emb)
-        padded_ivs = padded_ivs.at[i, :n].set(ivs)
-        # Unmask valid positions (both seq and interval are valid)
-        mask = mask.at[i, :n].set(False)
+        padded_emb[i, :n] = emb
+        padded_ivs[i, :n] = ivs
+        mask[i, :n] = False
 
     return padded_emb, padded_ivs, mask
 
 
 def pad_adjacency(
-    adjacency: Int[Array, "batch batch"],
+    adjacency: NDArray[np.int32],
     num_devices: int = 1,
-) -> Int[Array, "padded_batch padded_batch"]:
+) -> NDArray[np.int32]:
     """Pad adjacency matrix batch dimension to be divisible by num_devices.
 
+    Returns numpy array - caller transfers to device via device_put.
     Padded entries are set to 0 (no edge), so they contribute 0 weight to loss.
     """
     real_batch = adjacency.shape[0]
     padded_batch = _pad_to_multiple(real_batch, num_devices)
     if padded_batch == real_batch:
         return adjacency
-    padded = jnp.zeros((padded_batch, padded_batch), dtype=adjacency.dtype)
-    padded = padded.at[:real_batch, :real_batch].set(adjacency)
+    padded = np.zeros((padded_batch, padded_batch), dtype=np.int32)
+    padded[:real_batch, :real_batch] = adjacency
     return padded
 
 
@@ -389,8 +395,8 @@ def train_step_unpadded(
     model: CModel,
     opt_state: optax.OptState,
     optimizer: optax.GradientTransformation,
-    embeddings_batch: list[Float[Array, "n edim"]],
-    intervals_batch: list[Int[Array, "n 3"]],
+    embeddings_batch: Sequence[NDArray[np.generic]],
+    intervals_batch: Sequence[NDArray[np.generic]],
     adjacency: Int[Array, "batch batch"],
     edge_type_weights: Float[Array, "num_types"],
     temperature: float,
@@ -405,9 +411,9 @@ def train_step_unpadded(
         model,
         opt_state,
         optimizer,
-        padded_emb,
-        padded_ivs,
-        mask,
+        jnp.asarray(padded_emb),
+        jnp.asarray(padded_ivs),
+        jnp.asarray(mask),
         adjacency,
         edge_type_weights,
         temperature,
@@ -417,8 +423,11 @@ def train_step_unpadded(
 
 def _extract_batch_data(
     batch: ContrastiveBatch,
-) -> tuple[list[BFloat16[Array, "n edim"]], list[Int[Array, "n 3"]]]:
-    """Extract embeddings and intervals lists from batch (for JIT compatibility)."""
+) -> tuple[list[NDArray[np.generic]], list[NDArray[np.generic]]]:
+    """Extract embeddings and intervals lists from batch.
+
+    Returns numpy arrays (host memory) which are converted to JAX in pad_batch.
+    """
     embeddings = [bd.embeddings for bd in batch.bed_data]
     intervals = [bd.intervals for bd in batch.bed_data]
     return embeddings, intervals
