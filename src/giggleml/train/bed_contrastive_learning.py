@@ -200,6 +200,7 @@ class ContrastiveTrainingConfig:
     num_heads: int = 8
     output_dim: int = 128
     dropout_rate: float = 0.1
+    cross_attn_chunk_size: int = 1024
 
     # Training
     peak_learning_rate: float = 1e-4
@@ -486,6 +487,7 @@ def train(
         output_dim=config.output_dim,
         dropout_rate=config.dropout_rate,
         pooling="decode",
+        cross_attn_chunk_size=config.cross_attn_chunk_size,
         key=model_key,
     )
 

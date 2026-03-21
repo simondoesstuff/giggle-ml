@@ -22,12 +22,23 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from giggleml.models.genomic_interval import GenomicIntervalEncoder
 
 
-class CrossAttention(eqx.Module):
-    """Cross-attention: latents attend to inputs with pre-norm and residual."""
+class ChunkedCrossAttention(eqx.Module):
+    """Cross-attention with chunking over key/value dimension for memory efficiency.
 
-    attn: eqx.nn.MultiheadAttention
+    When inputs (N) >> latents (M), chunking over N reduces peak memory from
+    O(M * N) to O(M * chunk_size) while maintaining numerical correctness via
+    the log-sum-exp trick for softmax aggregation.
+    """
+
+    query_proj: eqx.nn.Linear
+    key_proj: eqx.nn.Linear
+    value_proj: eqx.nn.Linear
+    output_proj: eqx.nn.Linear
     ln: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
+    num_heads: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    chunk_size: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -35,15 +46,119 @@ class CrossAttention(eqx.Module):
         input_dim: int,
         num_heads: int,
         dropout_rate: float = 0.0,
+        chunk_size: int = 1024,
         *,
         key: PRNGKeyArray,
     ):
         super().__init__()
-        self.attn = eqx.nn.MultiheadAttention(
-            num_heads, latent_dim, key_size=input_dim, value_size=input_dim, key=key
-        )
+        assert latent_dim % num_heads == 0, "latent_dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = latent_dim // num_heads
+        self.chunk_size = chunk_size
+
+        keys = jax.random.split(key, 4)
+        self.query_proj = eqx.nn.Linear(latent_dim, latent_dim, key=keys[0])
+        self.key_proj = eqx.nn.Linear(input_dim, latent_dim, key=keys[1])
+        self.value_proj = eqx.nn.Linear(input_dim, latent_dim, key=keys[2])
+        self.output_proj = eqx.nn.Linear(latent_dim, latent_dim, key=keys[3])
         self.ln = eqx.nn.LayerNorm(latent_dim)
         self.dropout = eqx.nn.Dropout(dropout_rate)
+
+    def _chunked_attention(
+        self,
+        q: Float[Array, "num_latents num_heads head_dim"],
+        k: Float[Array, "input_len num_heads head_dim"],
+        v: Float[Array, "input_len num_heads head_dim"],
+        mask: Bool[Array, "input_len"] | None,
+    ) -> Float[Array, "num_latents num_heads head_dim"]:
+        """Compute attention with chunking over key/value dimension."""
+        num_latents = q.shape[0]
+        input_len = k.shape[0]
+        scale = self.head_dim**-0.5
+
+        # Initialize accumulators for online softmax
+        # Shape: (num_latents, num_heads)
+        max_scores = jnp.full((num_latents, self.num_heads), -jnp.inf)
+        sum_exp = jnp.zeros((num_latents, self.num_heads))
+        # Shape: (num_latents, num_heads, head_dim)
+        output = jnp.zeros((num_latents, self.num_heads, self.head_dim))
+
+        def process_chunk(
+            carry: tuple[Array, Array, Array], chunk_idx: Array
+        ) -> tuple[tuple[Array, Array, Array], None]:
+            max_scores, sum_exp, output = carry
+            start = chunk_idx * self.chunk_size
+            end = jnp.minimum(start + self.chunk_size, input_len)
+
+            # Dynamic slice for keys and values
+            k_chunk = jax.lax.dynamic_slice(
+                k, (start, 0, 0), (self.chunk_size, self.num_heads, self.head_dim)
+            )
+            v_chunk = jax.lax.dynamic_slice(
+                v, (start, 0, 0), (self.chunk_size, self.num_heads, self.head_dim)
+            )
+
+            # Compute attention scores: (num_latents, num_heads, chunk_size)
+            scores: Array = einx.dot("m h d, n h d -> m h n", q, k_chunk) * scale
+
+            # Apply mask if provided (True = masked out)
+            if mask is not None:
+                chunk_mask = jax.lax.dynamic_slice(mask, (start,), (self.chunk_size,))
+                # Create position mask for padding beyond input_len
+                pos_mask = jnp.arange(self.chunk_size) >= (end - start)
+                combined_mask = chunk_mask | pos_mask
+                scores = jnp.where(combined_mask[None, None, :], -jnp.inf, scores)
+            else:
+                # Still need to mask positions beyond input_len
+                pos_mask = jnp.arange(self.chunk_size) >= (end - start)
+                scores = jnp.where(pos_mask[None, None, :], -jnp.inf, scores)
+
+            # Online softmax update (log-sum-exp trick)
+            chunk_max = scores.max(axis=-1)  # (num_latents, num_heads)
+            new_max = jnp.maximum(max_scores, chunk_max)
+
+            # Rescale factors - handle -inf safely
+            # When new_max is -inf (all positions masked so far), set scales to 0
+            # to avoid NaN from exp(-inf - (-inf))
+            new_max_is_neg_inf = new_max == -jnp.inf
+            scale_prev = jnp.where(
+                new_max_is_neg_inf, 0.0, jnp.exp(max_scores - new_max)
+            )
+            scale_curr = jnp.where(
+                new_max_is_neg_inf, 0.0, jnp.exp(chunk_max - new_max)
+            )
+
+            # Compute exp(scores - chunk_max) for numerical stability
+            # When chunk_max is -inf, set to 0 to avoid NaN (will be scaled by 0 anyway)
+            chunk_max_is_neg_inf = chunk_max == -jnp.inf
+            scores_shifted = jnp.where(
+                chunk_max_is_neg_inf[:, :, None], 0.0, scores - chunk_max[:, :, None]
+            )
+            exp_scores = jnp.exp(scores_shifted)
+            chunk_sum = exp_scores.sum(axis=-1)  # (num_latents, num_heads)
+
+            # Update accumulators
+            sum_exp = sum_exp * scale_prev + chunk_sum * scale_curr
+
+            # Weighted values: (num_latents, num_heads, head_dim)
+            weighted_v: Array = einx.dot("m h n, n h d -> m h d", exp_scores, v_chunk)
+            output = output * scale_prev[:, :, None] + weighted_v * scale_curr[:, :, None]
+
+            return (new_max, sum_exp, output), None
+
+        num_chunks = (input_len + self.chunk_size - 1) // self.chunk_size
+        (max_scores, sum_exp, output), _ = jax.lax.scan(
+            process_chunk,
+            (max_scores, sum_exp, output),
+            jnp.arange(num_chunks),
+        )
+
+        # Final normalization - avoid division by zero when all positions masked
+        # Replace 0 with 1 to get 0/1=0 with valid gradients (jnp.where computes
+        # gradients through both branches, so division by 0 would give NaN grads)
+        sum_exp_safe = jnp.where(sum_exp > 0, sum_exp, 1.0)
+        output = output / sum_exp_safe[:, :, None]
+        return output
 
     def __call__(
         self,
@@ -53,15 +168,41 @@ class CrossAttention(eqx.Module):
         *,
         key: PRNGKeyArray | None = None,
     ) -> Float[Array, "num_latents latent_dim"]:
+        num_latents = latents.shape[0]
+        input_len = inputs.shape[0]
+
+        # Pre-norm on queries
         x = jax.vmap(self.ln)(latents)
-        # mask shape for MHA: (num_latents, input_len), True = attend
-        # Our input mask: True = masked/removed, so we invert
-        attn_mask: Bool[Array, "num_latents input_len"] | None = None
-        if mask is not None:
-            # Broadcast inverted mask to (num_latents, input_len)
-            attn_mask = jnp.broadcast_to(~mask, (latents.shape[0], mask.shape[0]))
-        attn_out = self.attn(x, inputs, inputs, mask=attn_mask)
+
+        # Project to multi-head format
+        q = jax.vmap(self.query_proj)(x)  # (num_latents, latent_dim)
+        k = jax.vmap(self.key_proj)(inputs)  # (input_len, latent_dim)
+        v = jax.vmap(self.value_proj)(inputs)  # (input_len, latent_dim)
+
+        # Reshape to (seq_len, num_heads, head_dim)
+        q = q.reshape(num_latents, self.num_heads, self.head_dim)
+        k = k.reshape(input_len, self.num_heads, self.head_dim)
+        v = v.reshape(input_len, self.num_heads, self.head_dim)
+
+        # Pad k and v to be divisible by chunk_size for scan efficiency
+        pad_len = (self.chunk_size - input_len % self.chunk_size) % self.chunk_size
+        if pad_len > 0:
+            k = jnp.pad(k, ((0, pad_len), (0, 0), (0, 0)))
+            v = jnp.pad(v, ((0, pad_len), (0, 0), (0, 0)))
+            if mask is not None:
+                # Pad mask with True (masked out)
+                mask = jnp.pad(mask, (0, pad_len), constant_values=True)
+
+        # Chunked attention
+        attn_out = self._chunked_attention(q, k, v, mask)
+
+        # Reshape back and project
+        attn_out = attn_out.reshape(num_latents, -1)
+        attn_out = jax.vmap(self.output_proj)(attn_out)
+
         return latents + self.dropout(attn_out, key=key)
+
+
 
 
 class EncoderBlock(eqx.Module):
@@ -134,7 +275,7 @@ class CModel(eqx.Module):
     latents: Float[Array, "num_latents latent_dim"]
     input_ffn: eqx.nn.MLP
     input_dropout: eqx.nn.Dropout
-    cross_attn: CrossAttention
+    cross_attn: ChunkedCrossAttention
     encoder_blocks: list[EncoderBlock]
     output_norm: eqx.nn.LayerNorm
     output_ffn: eqx.nn.MLP | None
@@ -162,6 +303,7 @@ class CModel(eqx.Module):
         output_ff_hidden_dim: int | None = None,
         dropout_rate: float = 0.0,
         pooling: str = "decode",
+        cross_attn_chunk_size: int = 1024,
         key: PRNGKeyArray,
     ):
         super().__init__()
@@ -193,8 +335,8 @@ class CModel(eqx.Module):
         )
         self.input_dropout = eqx.nn.Dropout(dropout_rate)
 
-        self.cross_attn = CrossAttention(
-            latent_dim, input_dim, num_heads, dropout_rate, key=keys[2]
+        self.cross_attn = ChunkedCrossAttention(
+            latent_dim, input_dim, num_heads, dropout_rate, cross_attn_chunk_size, key=keys[2]
         )
 
         self.encoder_blocks = [
@@ -352,6 +494,7 @@ def create_cmodel(
     output_ff_mult: int = 4,
     dropout_rate: float = 0.0,
     pooling: str = "decode",
+    cross_attn_chunk_size: int = 1024,
     interval_chrm_dim: int = 8,
     interval_size_dim: int = 8,
     interval_center_dim: int = 112,
@@ -374,6 +517,7 @@ def create_cmodel(
         output_ff_mult: Output FFN hidden dimension multiplier (relative to latent_dim).
         dropout_rate: Dropout rate for all dropout layers (default 0.0 = disabled).
         pooling: Output pooling strategy ('decode', 'mean', 'first', or 'none').
+        cross_attn_chunk_size: Chunk size for chunked cross-attention (default 1024).
         interval_chrm_dim: Chromosome embedding dimension.
         interval_size_dim: Size encoding dimension.
         interval_center_dim: Center PE dimension.
@@ -411,5 +555,6 @@ def create_cmodel(
         output_ff_hidden_dim=latent_dim * output_ff_mult,
         dropout_rate=dropout_rate,
         pooling=pooling,
+        cross_attn_chunk_size=cross_attn_chunk_size,
         key=keys[1],
     )

@@ -32,11 +32,12 @@ CONFIG = ContrastiveTrainingConfig(
     # Model architecture
     seq_dim=128,  # HyenaDNA tiny embedding dim
     latent_dim=512,
-    num_latents=8,
+    num_latents=512,
     shared_per_stack=1,
     num_stacks=4,
     num_heads=4,  # latent_dim / 64
     output_dim=128,
+    cross_attn_chunk_size=4096,
     # Training
     peak_learning_rate=1e-4,
     weight_decay=0.01,
@@ -61,7 +62,7 @@ SEED = 42
 
 # === Logging ===
 LOG_EVERY = 100
-CHECKPOINT_EVERY = None
+CHECKPOINT_EVERY = 500
 
 
 def get_bed_names(bed_dir: Path) -> list[str]:
@@ -128,6 +129,7 @@ def main() -> None:
     print("Training complete!")
 
 
+# export XLA_FLAGS="--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true"
+# export XLA_PYTHON_CLIENT_MEM_FRACTION=.90
 if __name__ == "__main__":
-    # export XLA_FLAGS="--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true"
     main()

@@ -7,19 +7,19 @@ import pytest
 
 from giggleml.models.cmodel import (
     CModel,
-    CrossAttention,
+    ChunkedCrossAttention,
     EncoderBlock,
     create_cmodel,
 )
 from giggleml.models.genomic_interval import GenomicIntervalEncoder
 
 
-class TestCrossAttention:
-    """Tests for CrossAttention module."""
+class TestChunkedCrossAttention:
+    """Tests for ChunkedCrossAttention module."""
 
     def test_output_shape(self):
         key = jax.random.key(0)
-        cross_attn = CrossAttention(latent_dim=64, input_dim=32, num_heads=4, key=key)
+        cross_attn = ChunkedCrossAttention(latent_dim=64, input_dim=32, num_heads=4, key=key)
 
         latents = jnp.ones((8, 64))  # 8 latents, 64 dims
         inputs = jnp.ones((100, 32))  # 100 inputs, 32 dims
@@ -29,7 +29,7 @@ class TestCrossAttention:
 
     def test_residual_connection(self):
         key = jax.random.key(0)
-        cross_attn = CrossAttention(latent_dim=64, input_dim=32, num_heads=4, key=key)
+        cross_attn = ChunkedCrossAttention(latent_dim=64, input_dim=32, num_heads=4, key=key)
 
         latents = jnp.ones((8, 64))
         inputs = jnp.zeros((100, 32))  # zeros to minimize attention contribution
@@ -40,7 +40,7 @@ class TestCrossAttention:
 
     def test_mask_excludes_positions(self):
         key = jax.random.key(0)
-        cross_attn = CrossAttention(latent_dim=64, input_dim=32, num_heads=4, key=key)
+        cross_attn = ChunkedCrossAttention(latent_dim=64, input_dim=32, num_heads=4, key=key)
 
         latents = jnp.ones((8, 64))
         inputs = jnp.ones((10, 32))
@@ -54,6 +54,269 @@ class TestCrossAttention:
         mask = jnp.array([True, False, True, False, True, False, True, False, True, False])
         output = cross_attn(latents, inputs, mask=mask)
         assert output.shape == (8, 64)
+
+    def test_no_nan_with_all_masked(self):
+        """Ensure no NaN when all positions are masked."""
+        key = jax.random.key(0)
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=4, key=key
+        )
+
+        latents = jnp.ones((8, 64))
+        inputs = jnp.ones((10, 32))
+        mask = jnp.ones(10, dtype=bool)  # All masked
+
+        output = cross_attn(latents, inputs, mask=mask)
+        assert not jnp.any(jnp.isnan(output)), "Output contains NaN with all masked"
+
+    def test_no_nan_with_partial_mask(self):
+        """Ensure no NaN with partial masking."""
+        key = jax.random.key(0)
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=4, key=key
+        )
+
+        latents = jnp.ones((8, 64))
+        inputs = jnp.ones((10, 32))
+        mask = jnp.array([True, True, True, True, True, False, False, False, False, False])
+
+        output = cross_attn(latents, inputs, mask=mask)
+        assert not jnp.any(jnp.isnan(output)), "Output contains NaN with partial mask"
+
+    def test_chunk_size_larger_than_input(self):
+        """Test when chunk_size > input_len."""
+        key = jax.random.key(0)
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=1024, key=key
+        )
+
+        latents = jnp.ones((8, 64))
+        inputs = jnp.ones((10, 32))  # Much smaller than chunk_size
+
+        output = cross_attn(latents, inputs)
+        assert output.shape == (8, 64)
+        assert not jnp.any(jnp.isnan(output)), "Output contains NaN when chunk > input"
+
+    def test_chunk_size_larger_than_input_with_mask(self):
+        """Test when chunk_size > input_len with masking."""
+        key = jax.random.key(0)
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=1024, key=key
+        )
+
+        latents = jnp.ones((8, 64))
+        inputs = jnp.ones((10, 32))
+        mask = jnp.array([True, False, True, False, True, False, True, False, True, False])
+
+        output = cross_attn(latents, inputs, mask=mask)
+        assert output.shape == (8, 64)
+        assert not jnp.any(jnp.isnan(output)), "Output contains NaN when chunk > input with mask"
+
+    def test_exact_chunk_boundary(self):
+        """Test when input_len is exact multiple of chunk_size."""
+        key = jax.random.key(0)
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=5, key=key
+        )
+
+        latents = jnp.ones((8, 64))
+        inputs = jnp.ones((10, 32))  # Exactly 2 chunks
+
+        output = cross_attn(latents, inputs)
+        assert output.shape == (8, 64)
+        assert not jnp.any(jnp.isnan(output))
+
+    def test_first_chunk_all_masked(self):
+        """Test when first chunk is all masked but later chunks have valid positions."""
+        key = jax.random.key(0)
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=4, key=key
+        )
+
+        latents = jnp.ones((8, 64))
+        inputs = jnp.ones((12, 32))  # 3 chunks of 4
+        # First chunk all masked, rest valid
+        mask = jnp.array([True, True, True, True, False, False, False, False, False, False, False, False])
+
+        output = cross_attn(latents, inputs, mask=mask)
+        assert output.shape == (8, 64)
+        assert not jnp.any(jnp.isnan(output)), "NaN when first chunk all masked"
+
+    def test_middle_chunk_all_masked(self):
+        """Test when middle chunk is all masked."""
+        key = jax.random.key(0)
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=4, key=key
+        )
+
+        latents = jnp.ones((8, 64))
+        inputs = jnp.ones((12, 32))  # 3 chunks of 4
+        # Middle chunk all masked
+        mask = jnp.array([False, False, False, False, True, True, True, True, False, False, False, False])
+
+        output = cross_attn(latents, inputs, mask=mask)
+        assert output.shape == (8, 64)
+        assert not jnp.any(jnp.isnan(output)), "NaN when middle chunk all masked"
+
+    def test_last_chunk_all_masked(self):
+        """Test when last chunk is all masked."""
+        key = jax.random.key(0)
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=4, key=key
+        )
+
+        latents = jnp.ones((8, 64))
+        inputs = jnp.ones((12, 32))  # 3 chunks of 4
+        # Last chunk all masked
+        mask = jnp.array([False, False, False, False, False, False, False, False, True, True, True, True])
+
+        output = cross_attn(latents, inputs, mask=mask)
+        assert output.shape == (8, 64)
+        assert not jnp.any(jnp.isnan(output)), "NaN when last chunk all masked"
+
+    def test_alternating_masked_chunks(self):
+        """Test alternating masked and valid chunks."""
+        key = jax.random.key(0)
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=2, key=key
+        )
+
+        latents = jnp.ones((8, 64))
+        inputs = jnp.ones((8, 32))  # 4 chunks of 2
+        # Alternating: masked, valid, masked, valid
+        mask = jnp.array([True, True, False, False, True, True, False, False])
+
+        output = cross_attn(latents, inputs, mask=mask)
+        assert output.shape == (8, 64)
+        assert not jnp.any(jnp.isnan(output)), "NaN with alternating masked chunks"
+
+    def test_random_inputs_no_nan(self):
+        """Test with random inputs to catch numerical instability."""
+        key = jax.random.key(42)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, key=k1
+        )
+
+        latents = jax.random.normal(k2, (8, 64))
+        inputs = jax.random.normal(k3, (100, 32))
+
+        output = cross_attn(latents, inputs)
+        assert not jnp.any(jnp.isnan(output)), "NaN with random inputs"
+        assert not jnp.any(jnp.isinf(output)), "Inf with random inputs"
+
+    def test_random_inputs_with_mask_no_nan(self):
+        """Test with random inputs and random mask."""
+        key = jax.random.key(42)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, key=k1
+        )
+
+        latents = jax.random.normal(k2, (8, 64))
+        inputs = jax.random.normal(k3, (100, 32))
+        mask = jax.random.bernoulli(k4, 0.3, (100,))  # 30% masked
+
+        output = cross_attn(latents, inputs, mask=mask)
+        assert not jnp.any(jnp.isnan(output)), "NaN with random masked inputs"
+        assert not jnp.any(jnp.isinf(output)), "Inf with random masked inputs"
+
+    def test_gradient_no_nan(self):
+        """Test that gradients don't contain NaN."""
+        key = jax.random.key(42)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, key=k1
+        )
+
+        latents = jax.random.normal(k2, (8, 64))
+        inputs = jax.random.normal(k3, (100, 32))
+
+        def loss_fn(model):
+            out = model(latents, inputs)
+            return jnp.sum(out**2)
+
+        grads = eqx.filter_grad(loss_fn)(cross_attn)
+        grad_arrays = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
+        for g in grad_arrays:
+            assert not jnp.any(jnp.isnan(g)), f"NaN in gradient: {g.shape}"
+            assert not jnp.any(jnp.isinf(g)), f"Inf in gradient: {g.shape}"
+
+    def test_gradient_with_mask_no_nan(self):
+        """Test that gradients don't contain NaN with masking."""
+        key = jax.random.key(42)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, key=k1
+        )
+
+        latents = jax.random.normal(k2, (8, 64))
+        inputs = jax.random.normal(k3, (100, 32))
+        mask = jax.random.bernoulli(k4, 0.3, (100,))
+
+        def loss_fn(model):
+            out = model(latents, inputs, mask=mask)
+            return jnp.sum(out**2)
+
+        grads = eqx.filter_grad(loss_fn)(cross_attn)
+        grad_arrays = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
+        for g in grad_arrays:
+            assert not jnp.any(jnp.isnan(g)), f"NaN in gradient with mask: {g.shape}"
+            assert not jnp.any(jnp.isinf(g)), f"Inf in gradient with mask: {g.shape}"
+
+    def test_gradient_all_masked_no_nan(self):
+        """Test gradients with all positions masked."""
+        key = jax.random.key(42)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, key=k1
+        )
+
+        latents = jax.random.normal(k2, (8, 64))
+        inputs = jax.random.normal(k3, (100, 32))
+        mask = jnp.ones(100, dtype=bool)  # All masked
+
+        def loss_fn(model):
+            out = model(latents, inputs, mask=mask)
+            return jnp.sum(out**2)
+
+        grads = eqx.filter_grad(loss_fn)(cross_attn)
+        grad_arrays = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
+        for g in grad_arrays:
+            assert not jnp.any(jnp.isnan(g)), f"NaN in gradient all masked: {g.shape}"
+
+    def test_bf16_no_nan(self):
+        """Test that bf16 precision doesn't cause NaN."""
+        from giggleml.utils.equinox import to_bf16
+
+        key = jax.random.key(42)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, key=k1
+        )
+        cross_attn = to_bf16(cross_attn)
+
+        latents = jax.random.normal(k2, (8, 64), dtype=jnp.bfloat16)
+        inputs = jax.random.normal(k3, (100, 32), dtype=jnp.bfloat16)
+        mask = jax.random.bernoulli(k4, 0.3, (100,))
+
+        output = cross_attn(latents, inputs, mask=mask)
+        assert not jnp.any(jnp.isnan(output)), "NaN in bf16 forward"
+
+        def loss_fn(model):
+            out = model(latents, inputs, mask=mask)
+            return jnp.sum(out.astype(jnp.float32) ** 2)
+
+        grads = eqx.filter_grad(loss_fn)(cross_attn)
+        grad_arrays = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
+        for g in grad_arrays:
+            assert not jnp.any(jnp.isnan(g)), f"NaN in bf16 gradient: {g.shape}"
 
 
 class TestEncoderBlock:
