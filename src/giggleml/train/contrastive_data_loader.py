@@ -69,10 +69,20 @@ class ContrastiveDataLoader:
 
     All BedFileData is cached in memory after first load for fast access.
 
+    Index Mapping for Train/Test/Val Splits:
+        When using a memmap built from all files but training on a subset (e.g.,
+        train/val split), the graph operates on nodes 0..n_subset-1 but the memmap
+        expects indices into the full file list. The index_map bridges this gap:
+
+        - Graph node i corresponds to file index_map[i] in bed_names/memmap
+        - Example: train_indices=[5, 12, 23, ...] means graph node 0 loads file 5
+
+        Without index_map, node indices map directly to file indices (identity mapping).
+
     Args:
         graph: SimilarityGraph for sampling subgraphs.
-        bed_names: List of BED file names (without path/extension)
-            matching graph node indices.
+        bed_names: List of BED file names (without path/extension). Must be the
+            full sorted list when using memmap, even if only a subset is used.
         embedding_dir: Directory containing zarr arrays of embeddings.
         bed_dir: Directory containing .bed files.
         num_anchors: Number of anchor nodes per batch.
@@ -82,6 +92,10 @@ class ContrastiveDataLoader:
         preload: If True, load all BED files into cache on init. If False, load lazily.
         memmap_dir: Optional directory containing pre-built memmap files.
             If provided, loads from memmap instead of individual zarr/BED files.
+        index_map: Mapping from graph node indices to file indices. Required when
+            using a subset of files with a memmap containing all files. The graph
+            size must equal len(index_map). If None, uses identity mapping and
+            graph size must equal len(bed_names).
     """
 
     graph: SimilarityGraph
@@ -93,6 +107,7 @@ class ContrastiveDataLoader:
     max_intervals: int | None
     _cache: dict[int, BedFileData]
     _memmap: ContrastiveMemmapData | None
+    _index_map: list[int] | None
 
     def __init__(
         self,
@@ -106,6 +121,7 @@ class ContrastiveDataLoader:
         max_intervals: int | None = None,
         preload: bool = False,
         memmap_dir: Pathish | None = None,
+        index_map: list[int] | None = None,
     ) -> None:
         self.graph = graph
         self.bed_names = sorted(bed_names)
@@ -115,6 +131,7 @@ class ContrastiveDataLoader:
         self.neighbors_per_anchor = neighbors_per_anchor
         self.max_intervals = max_intervals
         self._cache = {}
+        self._index_map = index_map
 
         # Load memmap if provided
         if memmap_dir is not None:
@@ -128,20 +145,30 @@ class ContrastiveDataLoader:
         else:
             self._memmap = None
 
-        if len(bed_names) != graph.n:
+        # Validate graph size matches index_map or bed_names
+        expected_graph_size = len(index_map) if index_map is not None else len(bed_names)
+        if expected_graph_size != graph.n:
             raise ValueError(
-                f"bed_names length ({len(bed_names)}) must match graph size ({graph.n})"
+                f"graph size ({graph.n}) must match "
+                f"{'index_map' if index_map else 'bed_names'} length ({expected_graph_size})"
             )
 
         if preload:
             self._preload_all()
 
+    def _file_idx(self, node_idx: int) -> int:
+        """Map graph node index to file index."""
+        if self._index_map is not None:
+            return self._index_map[node_idx]
+        return node_idx
+
     def _preload_all(self) -> None:
         """Load all BED files into cache."""
         desc = "Preloading from memmap" if self._memmap else "Preloading BED files"
-        for idx in tqdm(range(len(self.bed_names)), desc=desc):
-            if idx not in self._cache:
-                self._cache[idx] = self._load_bed_uncached(idx)
+        n_nodes = len(self._index_map) if self._index_map is not None else len(self.bed_names)
+        for node_idx in tqdm(range(n_nodes), desc=desc):
+            if node_idx not in self._cache:
+                self._cache[node_idx] = self._load_bed_uncached(node_idx)
 
     def _load_bed_uncached(self, node_idx: int) -> BedFileData:
         """Load BED file data from disk (no cache check).
@@ -149,13 +176,15 @@ class ContrastiveDataLoader:
         Data is kept as numpy arrays in host memory. Conversion to JAX
         arrays happens at batch time in pad_batch to minimize VRAM usage.
         """
+        file_idx = self._file_idx(node_idx)
+
         if self._memmap is not None:
             # Load from memmap - copy slice to contiguous numpy array
-            embeddings = np.array(self._memmap.get_embeddings(node_idx))
-            intervals = np.array(self._memmap.get_intervals(node_idx))
+            embeddings = np.array(self._memmap.get_embeddings(file_idx))
+            intervals = np.array(self._memmap.get_intervals(file_idx))
         else:
             # Load from individual zarr/BED files
-            name = self.bed_names[node_idx]
+            name = self.bed_names[file_idx]
 
             # Load embeddings from zarr as numpy
             zarr_path = self.embedding_dir / f"{name}.zarr"

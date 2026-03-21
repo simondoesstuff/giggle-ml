@@ -18,6 +18,7 @@ from giggleml.train.bed_contrastive_learning import (
     ContrastiveTrainingConfig,
     train,
 )
+from giggleml.utils.data_split import train_test_val_split
 
 # === Data Paths ===
 rme = Path("data/roadmap_epigenomics")
@@ -31,25 +32,25 @@ MEMMAP_DIR: Path | None = rme / "contrastive_memmap"
 CONFIG = ContrastiveTrainingConfig(
     # Model architecture
     seq_dim=128,  # HyenaDNA tiny embedding dim
-    latent_dim=512,
+    latent_dim=448,
     num_latents=512,
     shared_per_stack=1,
     num_stacks=4,
-    num_heads=4,  # latent_dim / 64
+    num_heads=7,  # latent_dim / 64
     output_dim=128,
-    cross_attn_chunk_size=4096,
+    cross_attn_chunk_size=2048,
     # Training
-    peak_learning_rate=1e-4,
+    peak_learning_rate=5e-3,
     weight_decay=0.01,
-    warmup_steps=1000,
+    warmup_steps=4000,
     total_steps=100_000,
-    temperature=0.07,
+    temperature=0.08,
     # Similarity binning: evenly spaced bins mapping (0, 50] -> (0, 1]
     bin_thresholds=(10, 20, 30, 40),
     bin_weights=(0.2, 0.4, 0.6, 0.8, 1.0),
     # Batch sampling: batch size is (anchors * (neighbors + 1))
-    num_anchors=16,
-    neighbors_per_anchor=4 - 1,
+    num_anchors=20,
+    neighbors_per_anchor=5 - 1,
     max_intervals=30_000,
     # Data paths (set from constants above)
     embedding_dir=EMBEDDING_DIR,
@@ -62,7 +63,12 @@ SEED = 42
 
 # === Logging ===
 LOG_EVERY = 100
+VAL_EVERY = 500
 CHECKPOINT_EVERY = 500
+
+# === Train/Test/Val Split ===
+TEST_FRACTION = 0.1
+VAL_FRACTION = 0.1
 
 
 def get_bed_names(bed_dir: Path) -> list[str]:
@@ -88,6 +94,12 @@ def main() -> None:
     bed_names = get_bed_names(BED_DIR)
     n_beds = len(bed_names)
     print(f"Found {n_beds} BED files")
+
+    # Train/test/val split (test set reserved for separate evaluation script)
+    split = train_test_val_split(
+        n_beds, test_fraction=TEST_FRACTION, val_fraction=VAL_FRACTION, seed=SEED
+    )
+    print(f"Split: {split.n_train} train, {split.n_val} val, {split.n_test} test")
 
     # Load similarity matrix
     print(f"Loading similarity matrix ({n_beds} x {n_beds})...")
@@ -121,7 +133,10 @@ def main() -> None:
         similarity_matrix=similarity_matrix,
         bed_names=bed_names,
         key=key,
+        train_indices=split.train,
+        val_indices=split.val,
         log_every=LOG_EVERY,
+        val_every=VAL_EVERY,
         checkpoint_every=CHECKPOINT_EVERY,
         checkpoint_dir=CHECKPOINT_DIR,
     )

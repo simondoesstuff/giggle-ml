@@ -281,6 +281,23 @@ def weighted_infonce_loss(
 # === Training ===
 
 
+def _subset_similarity_matrix(
+    similarity_matrix: SimilarityMatrix,
+    indices: list[int],
+) -> NDArray[np.floating]:
+    """Extract a submatrix from similarity matrix for given indices.
+
+    Args:
+        similarity_matrix: Full pairwise similarity matrix.
+        indices: Node indices to include in subset.
+
+    Returns:
+        Submatrix of shape (len(indices), len(indices)).
+    """
+    arr = similarity_matrix.array.astype(np.float32)
+    return arr[np.ix_(indices, indices)]
+
+
 def create_optimizer(config: ContrastiveTrainingConfig) -> optax.GradientTransformation:
     """Create optimizer with warmup cosine decay schedule.
 
@@ -422,6 +439,45 @@ def train_step_unpadded(
     )
 
 
+@eqx.filter_jit
+def val_step(
+    model: CModel,
+    padded_embeddings: Float[Array, "batch max_len edim"],
+    padded_intervals: Int[Array, "batch max_len 3"],
+    mask: Bool[Array, "batch max_len 2"],
+    adjacency: Int[Array, "batch batch"],
+    edge_type_weights: Float[Array, "num_types"],
+    temperature: float,
+) -> Float[Array, ""]:
+    """Compute validation loss without gradients or dropout.
+
+    Args:
+        model: CModel (in inference mode, no dropout).
+        padded_embeddings: Padded embeddings (batch, max_len, edim).
+        padded_intervals: Padded intervals (batch, max_len, 3).
+        mask: Padding mask (batch, max_len, 2). True = masked.
+        adjacency: Adjacency matrix (batch, batch).
+        edge_type_weights: Edge type weights.
+        temperature: InfoNCE temperature.
+
+    Returns:
+        Scalar validation loss.
+    """
+    batch_size = padded_embeddings.shape[0]
+    # No dropout during validation - pass None keys
+    dummy_keys = jax.random.split(jax.random.key(0), batch_size)
+
+    # Forward pass with inference=True (no dropout)
+    model_inf = eqx.nn.inference_mode(model)
+    batch_embeddings = _batched_forward(
+        model_inf, padded_embeddings, padded_intervals, mask, dummy_keys
+    )
+    batch_embeddings_f32 = batch_embeddings.astype(jnp.float32)
+    return weighted_infonce_loss(
+        batch_embeddings_f32, adjacency, edge_type_weights, temperature
+    )
+
+
 def _extract_batch_data(
     batch: ContrastiveBatch,
 ) -> tuple[list[NDArray[np.generic]], list[NDArray[np.generic]]]:
@@ -440,7 +496,10 @@ def train(
     bed_names: list[str],
     key: PRNGKeyArray,
     *,
+    train_indices: list[int] | None = None,
+    val_indices: list[int] | None = None,
     log_every: int = 100,
+    val_every: int = 500,
     checkpoint_every: int | None = None,
     checkpoint_dir: Path | None = None,
 ) -> CModel:
@@ -455,14 +514,17 @@ def train(
         bed_names: Ordered list of BED file names matching graph node indices.
             Should not include suffix.
         key: JAX PRNG key.
+        train_indices: Indices into bed_names for training set. If None, uses all.
+        val_indices: Indices into bed_names for validation set. If None, skips validation.
         log_every: Log loss every N steps.
+        val_every: Compute validation loss every N steps (requires val_indices).
         checkpoint_every: Save checkpoint every N steps (None to disable).
         checkpoint_dir: Directory to save checkpoints (required if checkpoint_every is set).
 
     Returns:
         Trained CModel (in f32).
     """
-    key, model_key, data_key, train_key = jax.random.split(key, 4)
+    key, model_key, data_key, train_key, val_key = jax.random.split(key, 5)
 
     # Set up device mesh for data parallelism
     mesh = create_device_mesh()
@@ -470,11 +532,18 @@ def train(
     num_devices = len(jax.devices())
     print(f"Training with {num_devices} device(s), bf16 precision")
 
-    # Build similarity graph from matrix + config thresholds
-    graph = SimilarityGraph(
-        similarity_matrix.array.astype(np.float32),
-        list(config.bin_thresholds),
-    )
+    # Handle train/val split
+    # bed_names must be sorted to match memmap ordering
+    bed_names = sorted(bed_names)
+    if train_indices is None:
+        train_indices = list(range(len(bed_names)))
+
+    if val_indices is not None:
+        print(f"Train/val split: {len(train_indices)} train, {len(val_indices)} val")
+
+    # Build similarity graph from train subset
+    train_sim = _subset_similarity_matrix(similarity_matrix, train_indices)
+    graph = SimilarityGraph(train_sim, list(config.bin_thresholds))
 
     # Create model with interval encoding mode
     model = create_cmodel(
@@ -509,8 +578,9 @@ def train(
     edge_type_weights = jnp.array(config.bin_weights, dtype=jnp.float32)
     edge_type_weights = jax.device_put(edge_type_weights, replicate)
 
-    # Create data loader
-    data_loader = ContrastiveDataLoader(
+    # Create training data loader
+    # Pass full bed_names with index_map for memmap compatibility
+    train_loader = ContrastiveDataLoader(
         graph=graph,
         bed_names=bed_names,
         embedding_dir=config.embedding_dir,
@@ -520,13 +590,33 @@ def train(
         max_intervals=config.max_intervals,
         preload=True,
         memmap_dir=config.memmap_dir,
+        index_map=train_indices,
     )
+
+    # Create validation data loader if val_indices provided
+    val_loader: ContrastiveDataLoader | None = None
+    if val_indices is not None:
+        val_sim = _subset_similarity_matrix(similarity_matrix, val_indices)
+        val_graph = SimilarityGraph(val_sim, list(config.bin_thresholds))
+        val_loader = ContrastiveDataLoader(
+            graph=val_graph,
+            bed_names=bed_names,
+            embedding_dir=config.embedding_dir,
+            bed_dir=config.bed_dir,
+            num_anchors=config.num_anchors,
+            neighbors_per_anchor=config.neighbors_per_anchor,
+            max_intervals=config.max_intervals,
+            preload=True,
+            memmap_dir=config.memmap_dir,
+            index_map=val_indices,
+        )
 
     # Sharding specs for batched data
     batch_shard = batch_sharding(mesh)
 
     # Training loop
-    batch_iter = data_loader.iter_batches(data_key)
+    batch_iter = train_loader.iter_batches(data_key)
+    val_batch_iter = val_loader.iter_batches(val_key) if val_loader else None
 
     for step in tqdm(range(config.total_steps), desc="Training"):
         train_key, step_key = jax.random.split(train_key)
@@ -560,7 +650,31 @@ def train(
         )
 
         if step % log_every == 0:
-            tqdm.write(f"Step {step}: loss = {float(loss):.4f}")
+            tqdm.write(f"Step {step}: train_loss = {float(loss):.4f}")
+
+        # Validation
+        if val_batch_iter is not None and step % val_every == 0:
+            val_batch = next(val_batch_iter)
+            val_emb, val_ivs = _extract_batch_data(val_batch)
+            padded_val_emb, padded_val_ivs, val_mask = pad_batch(
+                val_emb, val_ivs, num_devices
+            )
+            padded_val_emb = jax.device_put(padded_val_emb, batch_shard)
+            padded_val_ivs = jax.device_put(padded_val_ivs, batch_shard)
+            val_mask = jax.device_put(val_mask, batch_shard)
+            val_adjacency = pad_adjacency(val_batch.adjacency, num_devices)
+            val_adjacency = jax.device_put(val_adjacency, replicate)
+
+            val_loss = val_step(
+                model,
+                padded_val_emb,
+                padded_val_ivs,
+                val_mask,
+                val_adjacency,
+                edge_type_weights,
+                config.temperature,
+            )
+            tqdm.write(f"Step {step}: val_loss = {float(val_loss):.4f}")
 
         if checkpoint_every and checkpoint_dir and (step + 1) % checkpoint_every == 0:
             ckpt_path = checkpoint_dir / f"model_step_{step + 1}.eqx"
