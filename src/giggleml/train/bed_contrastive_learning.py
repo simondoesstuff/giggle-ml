@@ -77,9 +77,15 @@ def _next_power_of_two(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def _pad_to_multiple(n: int, divisor: int) -> int:
+    """Round n up to the nearest multiple of divisor."""
+    return ((n + divisor - 1) // divisor) * divisor
+
+
 def pad_batch(
     embeddings_list: list[Float[Array, "n edim"]],
     intervals_list: list[Int[Array, "n 3"]],
+    num_devices: int = 1,
 ) -> tuple[
     Float[Array, "batch pad_len edim"],
     Int[Array, "batch pad_len 3"],
@@ -88,11 +94,14 @@ def pad_batch(
     """Pad variable-length BED data to next power-of-two length for batched processing.
 
     Padding to powers of two enables better JIT cache reuse and allows XLA to
-    apply more automatic optimizations.
+    apply more automatic optimizations. Batch dimension is padded to be divisible
+    by num_devices for sharding.
 
     Args:
         embeddings_list: List of embedding arrays, each (n_i, edim).
         intervals_list: List of interval arrays, each (n_i, 3).
+        num_devices: Number of devices for batch sharding. Batch size will be
+            padded to a multiple of this.
 
     Returns:
         Tuple of:
@@ -100,7 +109,8 @@ def pad_batch(
         - Padded intervals: (batch, pad_len, 3)
         - Mask: (batch, pad_len, 2) where True = masked (padded position)
     """
-    batch_size = len(embeddings_list)
+    real_batch_size = len(embeddings_list)
+    batch_size = _pad_to_multiple(real_batch_size, num_devices)
     max_len = max(emb.shape[0] for emb in embeddings_list)
     pad_len = _next_power_of_two(max_len)
     edim = embeddings_list[0].shape[1]
@@ -120,6 +130,23 @@ def pad_batch(
         mask = mask.at[i, :n].set(False)
 
     return padded_emb, padded_ivs, mask
+
+
+def pad_adjacency(
+    adjacency: Int[Array, "batch batch"],
+    num_devices: int = 1,
+) -> Int[Array, "padded_batch padded_batch"]:
+    """Pad adjacency matrix batch dimension to be divisible by num_devices.
+
+    Padded entries are set to 0 (no edge), so they contribute 0 weight to loss.
+    """
+    real_batch = adjacency.shape[0]
+    padded_batch = _pad_to_multiple(real_batch, num_devices)
+    if padded_batch == real_batch:
+        return adjacency
+    padded = jnp.zeros((padded_batch, padded_batch), dtype=adjacency.dtype)
+    padded = padded.at[:real_batch, :real_batch].set(adjacency)
+    return padded
 
 
 # === Configuration ===
@@ -480,7 +507,7 @@ def train(
         num_anchors=config.num_anchors,
         neighbors_per_anchor=config.neighbors_per_anchor,
         max_intervals=config.max_intervals,
-        preload=False,
+        preload=True,
         memmap_dir=config.memmap_dir,
     )
 
@@ -496,13 +523,17 @@ def train(
         embeddings_batch, intervals_batch = _extract_batch_data(batch)
 
         # Pad to uniform length and shard across devices
-        padded_emb, padded_ivs, mask = pad_batch(embeddings_batch, intervals_batch)
+        padded_emb, padded_ivs, mask = pad_batch(
+            embeddings_batch, intervals_batch, num_devices
+        )
         padded_emb = jax.device_put(padded_emb, batch_shard)
         padded_ivs = jax.device_put(padded_ivs, batch_shard)
         mask = jax.device_put(mask, batch_shard)
 
         # Adjacency stays replicated (needed for full pairwise loss)
-        adjacency = jax.device_put(batch.adjacency, replicate)
+        # Pad to match batch dimension (padded entries have 0 edge weight)
+        adjacency = pad_adjacency(batch.adjacency, num_devices)
+        adjacency = jax.device_put(adjacency, replicate)
 
         model, opt_state, loss = train_step(
             model,

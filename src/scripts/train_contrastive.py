@@ -31,11 +31,11 @@ MEMMAP_DIR: Path | None = rme / "contrastive_memmap"
 CONFIG = ContrastiveTrainingConfig(
     # Model architecture
     seq_dim=128,  # HyenaDNA tiny embedding dim
-    latent_dim=256,
-    num_latents=512,
+    latent_dim=128,
+    num_latents=8,
     shared_per_stack=1,
     num_stacks=4,
-    num_heads=8,
+    num_heads=4,  # latent_dim / 64
     output_dim=128,
     # Training
     peak_learning_rate=1e-4,
@@ -46,10 +46,10 @@ CONFIG = ContrastiveTrainingConfig(
     # Similarity binning: evenly spaced bins mapping (0, 50] -> (0, 1]
     bin_thresholds=(10, 20, 30, 40),
     bin_weights=(0.2, 0.4, 0.6, 0.8, 1.0),
-    # Batch sampling
-    num_anchors=2,
-    neighbors_per_anchor=1,
-    max_intervals=10_000,
+    # Batch sampling: batch size is (anchors * (neighbors + 1))
+    num_anchors=16,
+    neighbors_per_anchor=7,
+    max_intervals=50_000,
     # Data paths (set from constants above)
     embedding_dir=EMBEDDING_DIR,
     bed_dir=BED_DIR,
@@ -129,4 +129,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # export XLA_FLAGS="--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true"
     main()
