@@ -42,6 +42,7 @@ from giggleml.train.contrastive_data_loader import (
 from giggleml.train.similarity_graph.similarity_graph import SimilarityGraph
 from giggleml.utils.equinox import save_checkpoint, to_bf16, to_f32
 from giggleml.utils.file_utils import Pathish
+from giggleml.utils.terminal_plot import TerminalLossPlotter
 
 # === Sharding Utilities ===
 
@@ -595,6 +596,7 @@ def train(
     val_every: int = 500,
     checkpoint_every: int | None = None,
     checkpoint_dir: Path | None = None,
+    plot_loss: bool = False,
 ) -> CModel:
     """Train CModel with contrastive learning using bf16 and data parallelism.
 
@@ -613,6 +615,7 @@ def train(
         val_every: Compute validation loss every N steps (requires val_indices).
         checkpoint_every: Save checkpoint every N steps (None to disable).
         checkpoint_dir: Directory to save checkpoints (required if checkpoint_every is set).
+        plot_loss: If True, display live loss plot in terminal using plotext.
 
     Returns:
         Trained CModel (in f32).
@@ -708,6 +711,11 @@ def train(
     # Sharding specs for batched data
     batch_shard = batch_sharding(mesh)
 
+    # Initialize loss plotter if enabled
+    plotter: TerminalLossPlotter | None = None
+    if plot_loss:
+        plotter = TerminalLossPlotter(title="Contrastive Training Loss")
+
     # Training loop
     batch_iter = train_loader.iter_batches(data_key)
     val_batch_iter = val_loader.iter_batches(val_key) if val_loader else None
@@ -748,6 +756,9 @@ def train(
 
         if step % log_every == 0:
             tqdm.write(f"Step {step}: train_loss = {float(loss):.4f}")
+            if plotter is not None:
+                plotter.add_train_loss(step, float(loss))
+                plotter.plot()
 
         # Validation
         if val_batch_iter is not None and step % val_every == 0:
@@ -772,6 +783,9 @@ def train(
                 config.temperature,
             )
             tqdm.write(f"Step {step}: val_loss = {float(val_loss):.4f}")
+            if plotter is not None:
+                plotter.add_val_loss(step, float(val_loss))
+                plotter.plot()
 
         if checkpoint_every and checkpoint_dir and (step + 1) % checkpoint_every == 0:
             ckpt_path = checkpoint_dir / f"model_step_{step + 1}.eqx"

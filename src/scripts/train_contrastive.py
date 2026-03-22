@@ -40,18 +40,18 @@ CONFIG = ContrastiveTrainingConfig(
     output_dim=128,
     cross_attn_chunk_size=4096,
     # Training
-    peak_learning_rate=2e-3,
+    peak_learning_rate=1e-3,
     weight_decay=0.01,
-    warmup_steps=3000,
-    total_steps=100_000,
+    warmup_steps=1500,
+    total_steps=50_000,
     temperature=0.07,
     # Similarity binning: evenly spaced bins mapping (0, 50] -> (0, 1]
     # 4 thresholds define 4 edge types (0-3), need 4 corresponding weights
     bin_thresholds=(10, 20, 30, 40),
     bin_weights=(0.25, 0.5, 0.75, 1.0),
     # Batch sampling: batch size is (anchors * (neighbors + 1))
-    num_anchors=20,
-    neighbors_per_anchor=5 - 1,
+    num_anchors=32,
+    neighbors_per_anchor=4 - 1,
     max_intervals=30_000,
     # Input dropout (data augmentation): mask random inputs during training
     # - seq only: model learns to rely on intervals
@@ -70,9 +70,10 @@ CONFIG = ContrastiveTrainingConfig(
 SEED = 42
 
 # === Logging ===
-LOG_EVERY = 100
-VAL_EVERY = 500
-CHECKPOINT_EVERY = 500
+LOG_EVERY = 50
+VAL_EVERY = 200
+CHECKPOINT_EVERY = 2500
+PLOT_LOSS = True  # Show live loss plot in terminal
 
 # === Train/Test/Val Split ===
 TEST_FRACTION = 0.1
@@ -147,12 +148,17 @@ def main() -> None:
         val_every=VAL_EVERY,
         checkpoint_every=CHECKPOINT_EVERY,
         checkpoint_dir=CHECKPOINT_DIR,
+        plot_loss=PLOT_LOSS,
     )
 
     print("Training complete!")
 
 
-# export XLA_FLAGS="--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true"
-# export XLA_PYTHON_CLIENT_MEM_FRACTION=.90
 if __name__ == "__main__":
+    """
+    export XLA_FLAGS="--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true"
+    export XLA_PYTHON_CLIENT_MEM_FRACTION=.90
+    export PYTHONUNBUFFERED=1
+    uv run src/scripts/train_contrastive.py | tee data/checkpoints/cmodel_x/log
+    """
     main()

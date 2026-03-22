@@ -15,6 +15,7 @@ dependencies = [
   "matplotlib>=3.10.1",
   "numpy>=2.2.5",
   "optax @ git+https://github.com/google-deepmind/optax.git@cbcd61da",
+  "plotext>=5.3.2",
   "pyfastx>=2.3.0",
   "pytest>=8.3.5",
   "scikit-learn>=1.6.1",
