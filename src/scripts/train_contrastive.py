@@ -25,33 +25,41 @@ rme = Path("data/roadmap_epigenomics")
 BED_DIR = rme / "beds"
 EMBEDDING_DIR = rme / "embeds"
 SIMILARITY_MATRIX_PATH = rme / "giggle_similarity.mat"
-CHECKPOINT_DIR = Path("data/checkpoints/cmodel_2026-3-18")
+CHECKPOINT_DIR = Path("data/checkpoints/cmodel_2026-3-22")
 MEMMAP_DIR: Path | None = rme / "contrastive_memmap"
 
 # === Training Configuration ===
 CONFIG = ContrastiveTrainingConfig(
     # Model architecture
     seq_dim=128,  # HyenaDNA tiny embedding dim
-    latent_dim=448,
+    latent_dim=512,
     num_latents=512,
     shared_per_stack=1,
     num_stacks=4,
-    num_heads=7,  # latent_dim / 64
+    num_heads=8,  # latent_dim / 64
     output_dim=128,
     cross_attn_chunk_size=2048,
     # Training
-    peak_learning_rate=5e-3,
+    peak_learning_rate=3e-3,
     weight_decay=0.01,
     warmup_steps=4000,
     total_steps=100_000,
-    temperature=0.08,
+    temperature=0.07,
     # Similarity binning: evenly spaced bins mapping (0, 50] -> (0, 1]
+    # 4 thresholds define 4 edge types (0-3), need 4 corresponding weights
     bin_thresholds=(10, 20, 30, 40),
-    bin_weights=(0.2, 0.4, 0.6, 0.8, 1.0),
+    bin_weights=(0.25, 0.5, 0.75, 1.0),
     # Batch sampling: batch size is (anchors * (neighbors + 1))
-    num_anchors=20,
-    neighbors_per_anchor=5 - 1,
+    num_anchors=16,
+    neighbors_per_anchor=4 - 1,
     max_intervals=30_000,
+    # Input dropout (data augmentation): mask random inputs during training
+    # - seq only: model learns to rely on intervals
+    # - interval only: model learns to rely on seq embeddings
+    # - both: position excluded, model learns from fewer intervals
+    input_dropout_seq=0.1,
+    input_dropout_interval=0.1,
+    input_dropout_both=0.05,
     # Data paths (set from constants above)
     embedding_dir=EMBEDDING_DIR,
     bed_dir=BED_DIR,

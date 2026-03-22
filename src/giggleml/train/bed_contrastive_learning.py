@@ -155,6 +155,82 @@ def pad_adjacency(
     return padded
 
 
+def apply_input_dropout(
+    mask: Bool[Array, "batch pad_len 2"],
+    p_seq: float,
+    p_interval: float,
+    p_both: float,
+    key: PRNGKeyArray,
+) -> Bool[Array, "batch pad_len 2"]:
+    """Apply random input dropout to non-padded positions.
+
+    Input dropout is a data augmentation strategy that randomly masks inputs,
+    forcing the model to learn robust representations. Three independent dropout
+    modes can be combined:
+
+    - p_seq: Probability of masking only the sequence embedding (interval preserved).
+        The seq embedding is replaced with a learned mask embedding.
+    - p_interval: Probability of masking only the interval encoding (seq preserved).
+        The interval encoding is replaced with a learned mask embedding.
+    - p_both: Probability of masking both seq and interval (position excluded).
+        The position is removed from cross-attention entirely.
+
+    These are applied independently per position. Positions already masked (padding)
+    remain masked. The probabilities are applied in order: first p_both, then p_seq
+    and p_interval on remaining positions.
+
+    Args:
+        mask: Current mask of shape (batch, pad_len, 2). True = masked.
+            Padding positions have both columns True.
+        p_seq: Probability of masking only sequence embedding.
+        p_interval: Probability of masking only interval encoding.
+        p_both: Probability of masking both (excluding position).
+        key: JAX PRNG key for reproducibility.
+
+    Returns:
+        Updated mask with random dropout applied to non-padded positions.
+    """
+    if p_seq == 0.0 and p_interval == 0.0 and p_both == 0.0:
+        return mask
+
+    batch, pad_len, _ = mask.shape
+    key_both, key_seq, key_interval = jax.random.split(key, 3)
+
+    # Identify non-padded positions (both columns False = valid position)
+    is_padding = mask[:, :, 0] & mask[:, :, 1]  # (batch, pad_len)
+    is_valid = ~is_padding
+
+    # Generate random values for dropout decisions
+    rand_both = jax.random.uniform(key_both, (batch, pad_len))
+    rand_seq = jax.random.uniform(key_seq, (batch, pad_len))
+    rand_interval = jax.random.uniform(key_interval, (batch, pad_len))
+
+    # Apply p_both: mask both columns for these positions
+    drop_both = is_valid & (rand_both < p_both)
+
+    # Apply p_seq and p_interval to positions not dropped by p_both
+    remaining = is_valid & ~drop_both
+    drop_seq_only = remaining & (rand_seq < p_seq)
+    drop_interval_only = remaining & (rand_interval < p_interval)
+
+    # Build new mask
+    # Start with original mask
+    new_seq_mask = mask[:, :, 0]
+    new_interval_mask = mask[:, :, 1]
+
+    # Apply drop_both: set both columns to True
+    new_seq_mask = new_seq_mask | drop_both
+    new_interval_mask = new_interval_mask | drop_both
+
+    # Apply drop_seq_only: set only seq column to True
+    new_seq_mask = new_seq_mask | drop_seq_only
+
+    # Apply drop_interval_only: set only interval column to True
+    new_interval_mask = new_interval_mask | drop_interval_only
+
+    return jnp.stack([new_seq_mask, new_interval_mask], axis=-1)
+
+
 # === Configuration ===
 
 
@@ -208,6 +284,14 @@ class ContrastiveTrainingConfig:
     warmup_steps: int = 1000
     total_steps: int = 100_000
     temperature: float = 0.07
+
+    # Input dropout (data augmentation)
+    # Probabilities for masking seq embeddings and/or interval encodings per position.
+    # When both are masked, the position is excluded from cross-attention.
+    # When only one is masked, it's replaced with a learned mask embedding.
+    input_dropout_seq: float = 0.0  # P(mask seq embedding)
+    input_dropout_interval: float = 0.0  # P(mask interval encoding)
+    input_dropout_both: float = 0.0  # P(mask both, excluding position)
 
     # Similarity graph binning
     bin_thresholds: tuple[float, ...] = (0.1, 0.3, 0.5, 0.7)
@@ -366,6 +450,9 @@ def train_step(
     edge_type_weights: Float[Array, "num_types"],
     temperature: float,
     key: PRNGKeyArray,
+    input_dropout_seq: float = 0.0,
+    input_dropout_interval: float = 0.0,
+    input_dropout_both: float = 0.0,
 ) -> tuple[CModel, optax.OptState, Float[Array, ""]]:
     """Perform a data-parallel training step with gradient checkpointing.
 
@@ -389,7 +476,13 @@ def train_step(
         Tuple of (updated_model, updated_opt_state, loss).
     """
     batch_size = padded_embeddings.shape[0]
+    key, input_dropout_key = jax.random.split(key)
     dropout_keys = jax.random.split(key, batch_size)
+
+    # Apply input dropout inside JIT to avoid memory leaks from traced ops outside JIT
+    mask = apply_input_dropout(
+        mask, input_dropout_seq, input_dropout_interval, input_dropout_both, input_dropout_key
+    )
 
     def loss_fn(model: CModel) -> Float[Array, ""]:
         # Forward pass - vmap over batch, sharding distributes across devices
@@ -647,6 +740,9 @@ def train(
             edge_type_weights,
             config.temperature,
             step_key,
+            config.input_dropout_seq,
+            config.input_dropout_interval,
+            config.input_dropout_both,
         )
 
         if step % log_every == 0:
