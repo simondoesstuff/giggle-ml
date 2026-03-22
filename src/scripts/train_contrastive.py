@@ -38,11 +38,11 @@ CONFIG = ContrastiveTrainingConfig(
     num_stacks=4,
     num_heads=8,  # latent_dim / 64
     output_dim=128,
-    cross_attn_chunk_size=2048,
+    cross_attn_chunk_size=4096,
     # Training
-    peak_learning_rate=3e-3,
+    peak_learning_rate=2e-3,
     weight_decay=0.01,
-    warmup_steps=4000,
+    warmup_steps=3000,
     total_steps=100_000,
     temperature=0.07,
     # Similarity binning: evenly spaced bins mapping (0, 50] -> (0, 1]
@@ -50,8 +50,8 @@ CONFIG = ContrastiveTrainingConfig(
     bin_thresholds=(10, 20, 30, 40),
     bin_weights=(0.25, 0.5, 0.75, 1.0),
     # Batch sampling: batch size is (anchors * (neighbors + 1))
-    num_anchors=16,
-    neighbors_per_anchor=4 - 1,
+    num_anchors=20,
+    neighbors_per_anchor=5 - 1,
     max_intervals=30_000,
     # Input dropout (data augmentation): mask random inputs during training
     # - seq only: model learns to rely on intervals

@@ -318,6 +318,93 @@ class TestChunkedCrossAttention:
         for g in grad_arrays:
             assert not jnp.any(jnp.isnan(g)), f"NaN in bf16 gradient: {g.shape}"
 
+    def test_checkpoint_forward(self):
+        """Test that checkpoint=True produces same output as checkpoint=False."""
+        key = jax.random.key(42)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        cross_attn_no_ckpt = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, checkpoint=False, key=k1
+        )
+        cross_attn_ckpt = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, checkpoint=True, key=k1
+        )
+
+        latents = jax.random.normal(k2, (8, 64))
+        inputs = jax.random.normal(k3, (100, 32))
+
+        out_no_ckpt = cross_attn_no_ckpt(latents, inputs)
+        out_ckpt = cross_attn_ckpt(latents, inputs)
+
+        assert jnp.allclose(out_no_ckpt, out_ckpt, atol=1e-5)
+
+    def test_checkpoint_gradient(self):
+        """Test that checkpoint=True produces correct gradients."""
+        key = jax.random.key(42)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, checkpoint=True, key=k1
+        )
+
+        latents = jax.random.normal(k2, (8, 64))
+        inputs = jax.random.normal(k3, (100, 32))
+
+        def loss_fn(model):
+            out = model(latents, inputs)
+            return jnp.sum(out**2)
+
+        grads = eqx.filter_grad(loss_fn)(cross_attn)
+        grad_arrays = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
+        for g in grad_arrays:
+            assert not jnp.any(jnp.isnan(g)), f"NaN in checkpoint gradient: {g.shape}"
+
+    def test_checkpoint_gradient_with_mask(self):
+        """Test that checkpoint=True works correctly with masking."""
+        key = jax.random.key(42)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, checkpoint=True, key=k1
+        )
+
+        latents = jax.random.normal(k2, (8, 64))
+        inputs = jax.random.normal(k3, (100, 32))
+        mask = jax.random.bernoulli(k4, 0.3, (100,))
+
+        def loss_fn(model):
+            out = model(latents, inputs, mask=mask)
+            return jnp.sum(out**2)
+
+        grads = eqx.filter_grad(loss_fn)(cross_attn)
+        grad_arrays = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
+        for g in grad_arrays:
+            assert not jnp.any(jnp.isnan(g)), f"NaN in checkpoint gradient with mask: {g.shape}"
+
+    def test_checkpoint_jit(self):
+        """Test that checkpoint=True works with JIT compilation."""
+        key = jax.random.key(42)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        cross_attn = ChunkedCrossAttention(
+            latent_dim=64, input_dim=32, num_heads=4, chunk_size=16, checkpoint=True, key=k1
+        )
+
+        latents = jax.random.normal(k2, (8, 64))
+        inputs = jax.random.normal(k3, (100, 32))
+
+        @eqx.filter_jit
+        def forward_and_grad(model, lat, inp):
+            def loss_fn(m):
+                return jnp.sum(m(lat, inp) ** 2)
+            return eqx.filter_value_and_grad(loss_fn)(model)
+
+        loss, grads = forward_and_grad(cross_attn, latents, inputs)
+        assert not jnp.isnan(loss)
+        grad_arrays = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
+        for g in grad_arrays:
+            assert not jnp.any(jnp.isnan(g)), f"NaN in JIT checkpoint gradient: {g.shape}"
+
 
 class TestEncoderBlock:
     """Tests for EncoderBlock module."""

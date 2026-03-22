@@ -650,6 +650,7 @@ def train(
         dropout_rate=config.dropout_rate,
         pooling="decode",
         cross_attn_chunk_size=config.cross_attn_chunk_size,
+        cross_attn_checkpoint=True,
         key=model_key,
     )
 
