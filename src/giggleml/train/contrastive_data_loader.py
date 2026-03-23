@@ -12,9 +12,6 @@ import numpy as np
 import zarr
 from jaxtyping import PRNGKeyArray
 from numpy.typing import NDArray
-
-# Type alias for numpy arrays in host memory
-type HostArray = NDArray[np.generic]
 from tqdm import tqdm
 
 from giggleml.data.contrastive_memmap import ContrastiveMemmapData
@@ -25,6 +22,9 @@ from giggleml.train.similarity_graph.community_subgraph import (
 from giggleml.train.similarity_graph.similarity_graph import SimilarityGraph
 from giggleml.utils.file_utils import Pathish
 
+# Type alias for numpy arrays in host memory
+type HostArray = NDArray[np.generic]
+
 
 @dataclass(frozen=True)
 class BedFileData:
@@ -34,7 +34,7 @@ class BedFileData:
     Conversion to JAX arrays happens at batch time.
 
     Attributes:
-        node_idx: Index of this file in the similarity graph.
+        node_idx: Index of this file in the cache/graph.
         embeddings: HyenaDNA embeddings of shape (n_intervals, embedding_dim).
         intervals: Genomic intervals of shape (n_intervals, 3) as [chrom_idx, start, end].
     """
@@ -61,82 +61,61 @@ class ContrastiveBatch:
     adjacency: NDArray[np.int32]
 
 
-class ContrastiveDataLoader:
-    """Data loader for contrastive learning on BED files.
+class BedFileCache:
+    """Cache for BED file data (embeddings + intervals).
 
-    Maps graph node indices to file paths via ordered bed_names list.
-    Uses community_subgraph_iterator for batch sampling.
-
-    All BedFileData is cached in memory after first load for fast access.
+    Handles loading from zarr/BED files or memmap, with in-memory caching.
+    Can be shared between training data loader and evaluation callbacks.
 
     Index Mapping for Train/Test/Val Splits:
-        When using a memmap built from all files but training on a subset (e.g.,
-        train/val split), the graph operates on nodes 0..n_subset-1 but the memmap
-        expects indices into the full file list. The index_map bridges this gap:
+        When using a memmap built from all files but operating on a subset,
+        the index_map bridges node indices (0..n_subset-1) to file indices
+        in the full bed_names/memmap.
 
-        - Graph node i corresponds to file index_map[i] in bed_names/memmap
-        - Example: train_indices=[5, 12, 23, ...] means graph node 0 loads file 5
+        - Node index i corresponds to file index_map[i] in bed_names/memmap
+        - Example: index_map=[5, 12, 23] means node 0 loads file 5
 
-        Without index_map, node indices map directly to file indices (identity mapping).
+        Without index_map, node indices map directly to file indices.
 
     Args:
-        graph: SimilarityGraph for sampling subgraphs.
         bed_names: List of BED file names (without path/extension). Must be the
-            full sorted list when using memmap, even if only a subset is used.
+            full sorted list when using memmap.
         embedding_dir: Directory containing zarr arrays of embeddings.
         bed_dir: Directory containing .bed files.
-        num_anchors: Number of anchor nodes per batch.
-        neighbors_per_anchor: Number of neighbors per anchor.
-        max_intervals: Maximum intervals per file. Files exceeding this are
-            randomly downsampled per-batch. None disables capping.
-        preload: If True, load all BED files into cache on init. If False, load lazily.
         memmap_dir: Optional directory containing pre-built memmap files.
-            If provided, loads from memmap instead of individual zarr/BED files.
-        index_map: Mapping from graph node indices to file indices. Required when
-            using a subset of files with a memmap containing all files. The graph
-            size must equal len(index_map). If None, uses identity mapping and
-            graph size must equal len(bed_names).
+        index_map: Mapping from node indices to file indices. If None, uses
+            identity mapping for all bed_names.
+        preload: If True, load all files into cache on init.
     """
 
-    graph: SimilarityGraph
     bed_names: list[str]
     embedding_dir: Path
     bed_dir: Path
-    num_anchors: int
-    neighbors_per_anchor: int
-    max_intervals: int | None
     _cache: dict[int, BedFileData]
     _memmap: ContrastiveMemmapData | None
     _index_map: list[int] | None
+    _n_files: int
 
     def __init__(
         self,
-        graph: SimilarityGraph,
         bed_names: list[str],
         embedding_dir: Pathish,
         bed_dir: Pathish,
-        num_anchors: int,
-        neighbors_per_anchor: int,
         *,
-        max_intervals: int | None = None,
-        preload: bool = False,
         memmap_dir: Pathish | None = None,
         index_map: list[int] | None = None,
+        preload: bool = False,
     ) -> None:
-        self.graph = graph
         self.bed_names = sorted(bed_names)
         self.embedding_dir = Path(embedding_dir)
         self.bed_dir = Path(bed_dir)
-        self.num_anchors = num_anchors
-        self.neighbors_per_anchor = neighbors_per_anchor
-        self.max_intervals = max_intervals
         self._cache = {}
         self._index_map = index_map
+        self._n_files = len(index_map) if index_map is not None else len(bed_names)
 
         # Load memmap if provided
         if memmap_dir is not None:
             self._memmap = ContrastiveMemmapData(memmap_dir, mode="r")
-            # Validate bed_names match memmap ordering
             if self._memmap.bed_names != self.bed_names:
                 raise ValueError(
                     f"bed_names mismatch: memmap has {len(self._memmap.bed_names)} files, "
@@ -145,19 +124,16 @@ class ContrastiveDataLoader:
         else:
             self._memmap = None
 
-        # Validate graph size matches index_map or bed_names
-        expected_graph_size = len(index_map) if index_map is not None else len(bed_names)
-        if expected_graph_size != graph.n:
-            raise ValueError(
-                f"graph size ({graph.n}) must match "
-                f"{'index_map' if index_map else 'bed_names'} length ({expected_graph_size})"
-            )
-
         if preload:
             self._preload_all()
 
+    @property
+    def n_files(self) -> int:
+        """Number of files managed by this cache."""
+        return self._n_files
+
     def _file_idx(self, node_idx: int) -> int:
-        """Map graph node index to file index."""
+        """Map node index to file index."""
         if self._index_map is not None:
             return self._index_map[node_idx]
         return node_idx
@@ -165,33 +141,23 @@ class ContrastiveDataLoader:
     def _preload_all(self) -> None:
         """Load all BED files into cache."""
         desc = "Preloading from memmap" if self._memmap else "Preloading BED files"
-        n_nodes = len(self._index_map) if self._index_map is not None else len(self.bed_names)
-        for node_idx in tqdm(range(n_nodes), desc=desc):
+        for node_idx in tqdm(range(self._n_files), desc=desc):
             if node_idx not in self._cache:
-                self._cache[node_idx] = self._load_bed_uncached(node_idx)
+                self._cache[node_idx] = self._load_uncached(node_idx)
 
-    def _load_bed_uncached(self, node_idx: int) -> BedFileData:
-        """Load BED file data from disk (no cache check).
-
-        Data is kept as numpy arrays in host memory. Conversion to JAX
-        arrays happens at batch time in pad_batch to minimize VRAM usage.
-        """
+    def _load_uncached(self, node_idx: int) -> BedFileData:
+        """Load BED file data from disk (no cache check)."""
         file_idx = self._file_idx(node_idx)
 
         if self._memmap is not None:
-            # Load from memmap - copy slice to contiguous numpy array
             embeddings = np.array(self._memmap.get_embeddings(file_idx))
             intervals = np.array(self._memmap.get_intervals(file_idx))
         else:
-            # Load from individual zarr/BED files
             name = self.bed_names[file_idx]
-
-            # Load embeddings from zarr as numpy
             zarr_path = self.embedding_dir / f"{name}.zarr"
             zarr_array = zarr.open_array(zarr_path, mode="r")
             embeddings = np.asarray(zarr_array[:], dtype=ml_dtypes.bfloat16)
 
-            # Load intervals from BED file (already numpy)
             bed_path = self.bed_dir / f"{name}.bed"
             intervals = load_bed_array(bed_path)
 
@@ -201,34 +167,96 @@ class ContrastiveDataLoader:
             intervals=intervals,
         )
 
-    def _load_bed(self, node_idx: int) -> BedFileData:
-        """Load BED file data for a given node index (cached)."""
+    def get(self, node_idx: int) -> BedFileData:
+        """Get BED file data for a node index (cached)."""
         if node_idx not in self._cache:
-            self._cache[node_idx] = self._load_bed_uncached(node_idx)
+            self._cache[node_idx] = self._load_uncached(node_idx)
         return self._cache[node_idx]
+
+    def get_all(self) -> list[BedFileData]:
+        """Return all BedFileData sorted by node index.
+
+        Loads any uncached files first.
+        """
+        for i in range(self._n_files):
+            if i not in self._cache:
+                self._cache[i] = self._load_uncached(i)
+        return [self._cache[i] for i in range(self._n_files)]
 
     def cache_size(self) -> int:
         """Return the number of cached BED files."""
         return len(self._cache)
 
-    def clear_cache(self) -> None:
+    def clear(self) -> None:
         """Clear the in-memory cache."""
         self._cache.clear()
 
-    def _downsample(self, data: BedFileData, key: PRNGKeyArray) -> BedFileData:
-        """Downsample a BedFileData to max_intervals if it exceeds the cap.
 
-        Downsampling is deterministic: the same JAX key produces the same sample.
-        """
+class ContrastiveDataLoader:
+    """Data loader for contrastive learning batch iteration.
+
+    Iterates over community subgraph batches using a shared BedFileCache.
+    Supports optional downsampling of large files during batch iteration.
+
+    Args:
+        cache: BedFileCache containing the BED file data.
+        graph: SimilarityGraph for sampling subgraphs.
+        num_anchors: Number of anchor nodes per batch.
+        neighbors_per_anchor: Number of neighbors per anchor.
+        max_intervals: Maximum intervals per file. Files exceeding this are
+            randomly downsampled per-batch. None disables capping.
+        index_map: Mapping from graph node indices to cache indices. Required
+            when graph is built on a subset (e.g., train split) but cache
+            contains all files. If None, graph nodes map directly to cache indices.
+    """
+
+    _cache: BedFileCache
+    _graph: SimilarityGraph
+    _num_anchors: int
+    _neighbors_per_anchor: int
+    _max_intervals: int | None
+    _index_map: list[int] | None
+
+    def __init__(
+        self,
+        cache: BedFileCache,
+        graph: SimilarityGraph,
+        num_anchors: int,
+        neighbors_per_anchor: int,
+        *,
+        max_intervals: int | None = None,
+        index_map: list[int] | None = None,
+    ) -> None:
+        expected_size = len(index_map) if index_map is not None else cache.n_files
+        if graph.n != expected_size:
+            raise ValueError(
+                f"graph size ({graph.n}) must match "
+                f"{'index_map length' if index_map else 'cache n_files'} ({expected_size})"
+            )
+        self._cache = cache
+        self._graph = graph
+        self._num_anchors = num_anchors
+        self._neighbors_per_anchor = neighbors_per_anchor
+        self._max_intervals = max_intervals
+        self._index_map = index_map
+
+    def _cache_idx(self, graph_node: int) -> int:
+        """Map graph node index to cache index."""
+        if self._index_map is not None:
+            return self._index_map[graph_node]
+        return graph_node
+
+    def _downsample(
+        self, data: BedFileData, max_intervals: int, key: PRNGKeyArray
+    ) -> BedFileData:
+        """Downsample a BedFileData to max_intervals if it exceeds the cap."""
         n = data.embeddings.shape[0]
-        if self.max_intervals is None or n <= self.max_intervals:
+        if n <= max_intervals:
             return data
 
-        # Deterministic seed from JAX key - use full key data as numpy RNG seed
-        # This ensures reproducibility: same key -> same sample
         seed = np.asarray(jax.random.key_data(key))
         rng = np.random.default_rng(seed)
-        indices = rng.choice(n, size=self.max_intervals, replace=False)
+        indices = rng.choice(n, size=max_intervals, replace=False)
 
         return BedFileData(
             node_idx=data.node_idx,
@@ -247,11 +275,17 @@ class ContrastiveDataLoader:
         """
         key, subgraph_key = jax.random.split(key)
         for node_indices, adjacency in community_subgraph_iterator(
-            self.graph, self.num_anchors, self.neighbors_per_anchor, key=subgraph_key
+            self._graph,
+            self._num_anchors,
+            self._neighbors_per_anchor,
+            key=subgraph_key,
         ):
             key, *file_keys = jax.random.split(key, len(node_indices) + 1)
-            bed_data = [
-                self._downsample(self._load_bed(int(idx)), file_keys[i])
-                for i, idx in enumerate(node_indices)
-            ]
+            bed_data = []
+            for i, graph_node in enumerate(node_indices):
+                cache_idx = self._cache_idx(int(graph_node))
+                data = self._cache.get(cache_idx)
+                if self._max_intervals is not None:
+                    data = self._downsample(data, self._max_intervals, file_keys[i])
+                bed_data.append(data)
             yield ContrastiveBatch(bed_data, np.asarray(adjacency, dtype=np.int32))

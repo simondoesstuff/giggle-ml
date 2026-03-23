@@ -5,8 +5,12 @@ from pathlib import Path
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 from jaxtyping import Array
 
+from giggleml.models.cmodel import CModel
 from giggleml.utils.file_utils import Pathish
 
 
@@ -56,3 +60,29 @@ def load_checkpoint[T](path: Pathish, model_template: T) -> T:
         Loaded T.
     """
     return eqx.tree_deserialise_leaves(Path(path), model_template)
+
+
+# === Sharding Utilities ===
+
+
+def create_device_mesh() -> Mesh:
+    """Create a 1D device mesh across all available devices."""
+    devices = jax.devices()
+    return Mesh(np.array(devices), axis_names=("batch",))
+
+
+def replicated_sharding(mesh: Mesh) -> NamedSharding:
+    """Create sharding spec for replicated data (model params)."""
+    return NamedSharding(mesh, P())
+
+
+def batch_sharding(mesh: Mesh) -> NamedSharding:
+    """Create sharding spec for batch-sharded data."""
+    return NamedSharding(mesh, P("batch"))
+
+
+def shard_model(model: CModel, sharding: NamedSharding) -> CModel:
+    """Shard model arrays while preserving non-array leaves (functions, static fields)."""
+    arrays, non_arrays = eqx.partition(model, eqx.is_array)
+    arrays = jax.device_put(arrays, sharding)
+    return eqx.combine(arrays, non_arrays)

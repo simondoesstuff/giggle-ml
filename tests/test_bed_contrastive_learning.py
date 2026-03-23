@@ -18,6 +18,7 @@ from giggleml.train.bed_contrastive_learning import (
     weighted_infonce_loss,
 )
 from giggleml.train.contrastive_data_loader import (
+    BedFileCache,
     BedFileData,
     ContrastiveBatch,
     ContrastiveDataLoader,
@@ -595,7 +596,6 @@ class TestContrastiveDataLoaderDownsampling:
     def test_downsample_returns_unchanged_when_below_cap(self):
         """Data under max_intervals should be returned unchanged."""
         loader = ContrastiveDataLoader.__new__(ContrastiveDataLoader)
-        loader.max_intervals = 100
 
         data = BedFileData(
             node_idx=0,
@@ -604,14 +604,13 @@ class TestContrastiveDataLoaderDownsampling:
         )
         key = jax.random.key(42)
 
-        result = loader._downsample(data, key)
+        result = loader._downsample(data, max_intervals=100, key=key)
 
         assert result is data  # Same object, not a copy
 
     def test_downsample_reduces_to_max_intervals(self):
         """Data over max_intervals should be reduced to exactly max_intervals."""
         loader = ContrastiveDataLoader.__new__(ContrastiveDataLoader)
-        loader.max_intervals = 50
 
         data = BedFileData(
             node_idx=0,
@@ -620,7 +619,7 @@ class TestContrastiveDataLoaderDownsampling:
         )
         key = jax.random.key(42)
 
-        result = loader._downsample(data, key)
+        result = loader._downsample(data, max_intervals=50, key=key)
 
         assert result.embeddings.shape[0] == 50
         assert result.intervals.shape[0] == 50
@@ -629,7 +628,6 @@ class TestContrastiveDataLoaderDownsampling:
     def test_downsample_selects_correct_pairs(self):
         """Downsampled embeddings and intervals should stay paired."""
         loader = ContrastiveDataLoader.__new__(ContrastiveDataLoader)
-        loader.max_intervals = 10
 
         # Create data where embedding[i] has unique values matching interval[i]
         embeddings = jnp.arange(100).reshape(100, 1).astype(jnp.float32)
@@ -639,7 +637,7 @@ class TestContrastiveDataLoaderDownsampling:
         data = BedFileData(node_idx=0, embeddings=embeddings, intervals=intervals)
         key = jax.random.key(42)
 
-        result = loader._downsample(data, key)
+        result = loader._downsample(data, max_intervals=10, key=key)
 
         # Each embedding value should match the corresponding interval start
         assert jnp.allclose(result.embeddings[:, 0], result.intervals[:, 1])
@@ -647,7 +645,6 @@ class TestContrastiveDataLoaderDownsampling:
     def test_downsample_different_keys_different_samples(self):
         """Different PRNG keys should produce different samples."""
         loader = ContrastiveDataLoader.__new__(ContrastiveDataLoader)
-        loader.max_intervals = 10
 
         data = BedFileData(
             node_idx=0,
@@ -655,8 +652,8 @@ class TestContrastiveDataLoaderDownsampling:
             intervals=jnp.arange(96).reshape(32, 3),
         )
 
-        result1 = loader._downsample(data, jax.random.key(1))
-        result2 = loader._downsample(data, jax.random.key(2))
+        result1 = loader._downsample(data, max_intervals=10, key=jax.random.key(1))
+        result2 = loader._downsample(data, max_intervals=10, key=jax.random.key(2))
 
         # Different keys should give different samples
         assert not jnp.array_equal(result1.intervals, result2.intervals)
@@ -664,7 +661,6 @@ class TestContrastiveDataLoaderDownsampling:
     def test_downsample_same_key_same_sample(self):
         """Same PRNG key should produce identical samples."""
         loader = ContrastiveDataLoader.__new__(ContrastiveDataLoader)
-        loader.max_intervals = 10
 
         data = BedFileData(
             node_idx=0,
@@ -672,45 +668,18 @@ class TestContrastiveDataLoaderDownsampling:
             intervals=jnp.arange(96).reshape(32, 3),
         )
 
-        result1 = loader._downsample(data, jax.random.key(42))
-        result2 = loader._downsample(data, jax.random.key(42))
+        result1 = loader._downsample(data, max_intervals=10, key=jax.random.key(42))
+        result2 = loader._downsample(data, max_intervals=10, key=jax.random.key(42))
 
         assert jnp.array_equal(result1.intervals, result2.intervals)
         assert jnp.array_equal(result1.embeddings, result2.embeddings)
 
-    def test_downsample_none_max_intervals_unchanged(self):
-        """max_intervals=None should return data unchanged."""
-        loader = ContrastiveDataLoader.__new__(ContrastiveDataLoader)
-        loader.max_intervals = None
-
-        data = BedFileData(
-            node_idx=0,
-            embeddings=jnp.ones((1000, 32)),
-            intervals=jnp.arange(3000).reshape(1000, 3),
-        )
-        key = jax.random.key(42)
-
-        result = loader._downsample(data, key)
-
-        assert result is data
-
     def test_cache_stores_full_data(self, tmp_path):
         """Cache should store full data, not downsampled."""
-        # Create a minimal valid similarity graph
-        matrix = np.array(
-            [[0.0, 0.5], [0.5, 0.0]],
-            dtype=np.float32,
-        )
-        graph = SimilarityGraph(matrix, thresholds=[0.3])
-
-        loader = ContrastiveDataLoader(
-            graph=graph,
+        cache = BedFileCache(
             bed_names=["bed0", "bed1"],
             embedding_dir=tmp_path,
             bed_dir=tmp_path,
-            num_anchors=1,
-            neighbors_per_anchor=1,
-            max_intervals=10,
         )
 
         # Manually populate cache with large data
@@ -719,54 +688,36 @@ class TestContrastiveDataLoaderDownsampling:
             embeddings=jnp.ones((500, 32)),
             intervals=jnp.arange(1500).reshape(500, 3),
         )
-        loader._cache[0] = large_data
+        cache._cache[0] = large_data
 
         # Verify cache has full data
-        assert loader._cache[0].embeddings.shape[0] == 500
+        assert cache._cache[0].embeddings.shape[0] == 500
 
 
-class TestContrastiveDataLoaderCache:
-    """Tests for ContrastiveDataLoader caching functionality."""
+class TestBedFileCache:
+    """Tests for BedFileCache functionality."""
 
-    @pytest.fixture
-    def sample_graph(self):
-        matrix = np.array(
-            [
-                [0.0, 0.4, 0.7],
-                [0.4, 0.0, 0.6],
-                [0.7, 0.6, 0.0],
-            ],
-            dtype=np.float32,
-        )
-        return SimilarityGraph(matrix, thresholds=[0.3, 0.6])
-
-    def test_cache_starts_empty(self, sample_graph, tmp_path):
-        loader = ContrastiveDataLoader(
-            graph=sample_graph,
+    def test_cache_starts_empty(self, tmp_path):
+        cache = BedFileCache(
             bed_names=["bed0", "bed1", "bed2"],
             embedding_dir=tmp_path,
             bed_dir=tmp_path,
-            num_anchors=2,
-            neighbors_per_anchor=1,
         )
-        assert loader.cache_size() == 0
+        assert cache.cache_size() == 0
 
-    def test_clear_cache(self, sample_graph, tmp_path):
-        loader = ContrastiveDataLoader(
-            graph=sample_graph,
+    def test_clear_cache(self, tmp_path):
+        cache = BedFileCache(
             bed_names=["bed0", "bed1", "bed2"],
             embedding_dir=tmp_path,
             bed_dir=tmp_path,
-            num_anchors=2,
-            neighbors_per_anchor=1,
         )
         # Manually add something to cache
-        loader._cache[0] = BedFileData(
+        cache._cache[0] = BedFileData(
             node_idx=0,
             embeddings=jnp.ones((5, 32)),
             intervals=jnp.array([[0, 100, 200]] * 5),
         )
-        assert loader.cache_size() == 1
+        assert cache.cache_size() == 1
 
-        loader.clear_cache()
-        assert loader.cache_size() == 0
+        cache.clear()
+        assert cache.cache_size() == 0

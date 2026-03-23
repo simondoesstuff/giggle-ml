@@ -14,10 +14,12 @@ from pathlib import Path
 import jax
 
 from giggleml.data.similarity_matrix import SimilarityMatrix
+from giggleml.evaluation.ndcg import create_ndcg_callback
 from giggleml.train.bed_contrastive_learning import (
     ContrastiveTrainingConfig,
     train,
 )
+from giggleml.train.contrastive_data_loader import BedFileCache
 from giggleml.utils.data_split import train_test_val_split
 
 # === Data Paths ===
@@ -44,21 +46,21 @@ CONFIG = ContrastiveTrainingConfig(
     weight_decay=0.01,
     warmup_steps=1500,
     total_steps=50_000,
-    temperature=0.07,
+    temperature=0.15,
     # Similarity binning: evenly spaced bins mapping (0, 50] -> (0, 1]
     # 4 thresholds define 4 edge types (0-3), need 4 corresponding weights
     bin_thresholds=(10, 20, 30, 40),
     bin_weights=(0.25, 0.5, 0.75, 1.0),
     # Batch sampling: batch size is (anchors * (neighbors + 1))
-    num_anchors=32,
-    neighbors_per_anchor=4 - 1,
+    num_anchors=64,
+    neighbors_per_anchor=1,
     max_intervals=30_000,
     # Input dropout (data augmentation): mask random inputs during training
     # - seq only: model learns to rely on intervals
     # - interval only: model learns to rely on seq embeddings
     # - both: position excluded, model learns from fewer intervals
-    input_dropout_seq=0.1,
-    input_dropout_interval=0.1,
+    input_dropout_seq=0.3,
+    input_dropout_interval=0.3,
     input_dropout_both=0.05,
     # Data paths (set from constants above)
     embedding_dir=EMBEDDING_DIR,
@@ -70,14 +72,18 @@ CONFIG = ContrastiveTrainingConfig(
 SEED = 42
 
 # === Logging ===
-LOG_EVERY = 50
+LOG_EVERY = 20
 VAL_EVERY = 200
-CHECKPOINT_EVERY = 2500
+CHECKPOINT_EVERY = None
 PLOT_LOSS = True  # Show live loss plot in terminal
 
 # === Train/Test/Val Split ===
 TEST_FRACTION = 0.1
 VAL_FRACTION = 0.1
+
+# === nDCG Evaluation ===
+EVAL_EVERY = 1  # Run nDCG evaluation every N steps
+NDCG_K = 10  # Top-K for nDCG metric
 
 
 def get_bed_names(bed_dir: Path) -> list[str]:
@@ -135,13 +141,40 @@ def main() -> None:
     # Initialize PRNG
     key = jax.random.key(SEED)
 
-    # Train
+    # Create shared cache for all BED files (used by training and nDCG eval)
+    print("Loading all BED files...")
+    cache = BedFileCache(
+        bed_names=bed_names,
+        embedding_dir=CONFIG.embedding_dir,
+        bed_dir=CONFIG.bed_dir,
+        memmap_dir=CONFIG.memmap_dir,
+        preload=True,
+    )
+
+    # Create nDCG evaluation callback using shared cache
+    effective_batch_size = CONFIG.num_anchors * (CONFIG.neighbors_per_anchor + 1)
+    all_bed_data = cache.get_all()
+    ndcg_callback = create_ndcg_callback(
+        bed_data=all_bed_data,
+        similarity_matrix=similarity_matrix,
+        bin_thresholds=CONFIG.bin_thresholds,
+        bin_weights=CONFIG.bin_weights,
+        anchor_indices=None,  # All files as anchors
+        batch_size=32,
+        k=NDCG_K,
+    )
+    print(
+        f"nDCG@{NDCG_K} evaluation: all {len(all_bed_data)} files as anchors (all-to-all)"
+    )
+
+    # Train (uses same cache)
     print("Starting training...")
     train(
         config=CONFIG,
         similarity_matrix=similarity_matrix,
         bed_names=bed_names,
         key=key,
+        cache=cache,
         train_indices=split.train,
         val_indices=split.val,
         log_every=LOG_EVERY,
@@ -149,6 +182,8 @@ def main() -> None:
         checkpoint_every=CHECKPOINT_EVERY,
         checkpoint_dir=CHECKPOINT_DIR,
         plot_loss=PLOT_LOSS,
+        eval_callbacks=[(f"nDCG@{NDCG_K}", ndcg_callback)],
+        eval_every=EVAL_EVERY,
     )
 
     print("Training complete!")
@@ -156,6 +191,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     """
+    # VRAM Model
+    # https://www.desmos.com/calculator/d6rmfta1l0
+
     export XLA_FLAGS="--xla_gpu_enable_cudnn_fmha=true --xla_gpu_fused_attention_use_cudnn_rng=true"
     export XLA_PYTHON_CLIENT_MEM_FRACTION=.90
     export PYTHONUNBUFFERED=1

@@ -1,93 +1,221 @@
-"""Data-parallel inference utilities for Equinox models.
+"""Inference utilities for CModel.
 
-Provides functions for distributing inference across multiple JAX devices using
-SPMD (Single Program Multiple Data) parallelism via JAX's sharding APIs.
+Provides efficient batched inference with proper memory management.
+Shared utilities for both training and inference.
 """
 
-from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from typing import Generic, TypeVar
+from __future__ import annotations
+
+from collections.abc import Sequence
 
 import equinox as eqx
 import jax
-from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
-from jaxtyping import Array
+import jax.numpy as jnp
+import numpy as np
+from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from numpy.typing import NDArray
 
-T = TypeVar("T")
+from giggleml.models.cmodel import CModel
+from giggleml.train.contrastive_data_loader import BedFileData
+from giggleml.utils.equinox import batch_sharding, create_device_mesh
+
+# === Batch Padding Utilities ===
 
 
-class CallableModule(eqx.Module, ABC, Generic[T]):
-    """Equinox modules that are callable with a generic output type."""
+def _next_power_of_two(n: int) -> int:
+    """Return the smallest power of two >= n."""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
 
-    @abstractmethod
-    def __call__(self, *args: Array) -> T: ...
+
+def pad_to_multiple(n: int, divisor: int) -> int:
+    """Round n up to the nearest multiple of divisor."""
+    return ((n + divisor - 1) // divisor) * divisor
+
+
+def pad_batch(
+    embeddings_list: Sequence[NDArray[np.generic]],
+    intervals_list: Sequence[NDArray[np.generic]],
+    num_devices: int = 1,
+) -> tuple[
+    NDArray[np.generic],
+    NDArray[np.int32],
+    NDArray[np.bool_],
+]:
+    """Pad variable-length BED data to next power-of-two length for batched processing.
+
+    Takes numpy arrays (host memory) and returns numpy arrays. Caller should use
+    jax.device_put() to transfer to device with appropriate sharding - this allows
+    a single host->device transfer without intermediate GPU allocations.
+
+    Padding to powers of two enables better JIT cache reuse and allows XLA to
+    apply more automatic optimizations. Batch dimension is padded to be divisible
+    by num_devices for sharding.
+
+    Args:
+        embeddings_list: List of numpy embedding arrays, each (n_i, edim).
+        intervals_list: List of numpy interval arrays, each (n_i, 3).
+        num_devices: Number of devices for batch sharding. Batch size will be
+            padded to a multiple of this.
+
+    Returns:
+        Tuple of numpy arrays (caller transfers to device):
+        - Padded embeddings: (batch, pad_len, edim) where pad_len is next power of 2
+        - Padded intervals: (batch, pad_len, 3)
+        - Mask: (batch, pad_len, 2) where True = masked (padded position)
+    """
+    real_batch_size = len(embeddings_list)
+    batch_size = pad_to_multiple(real_batch_size, num_devices)
+    max_len = max(emb.shape[0] for emb in embeddings_list)
+    pad_len = _next_power_of_two(max_len)
+    edim = embeddings_list[0].shape[1]
+
+    # Build padded arrays in numpy (CPU) - caller transfers to device
+    padded_emb = np.zeros((batch_size, pad_len, edim), dtype=embeddings_list[0].dtype)
+    padded_ivs = np.zeros((batch_size, pad_len, 3), dtype=np.int32)
+    # Mask: True = masked/padded, starts all True
+    mask = np.ones((batch_size, pad_len, 2), dtype=np.bool_)
+
+    # Fill in actual data and unmask valid positions
+    for i, (emb, ivs) in enumerate(zip(embeddings_list, intervals_list)):
+        n = emb.shape[0]
+        padded_emb[i, :n] = emb
+        padded_ivs[i, :n] = ivs
+        mask[i, :n] = False
+
+    return padded_emb, padded_ivs, mask
+
+
+# === Forward Pass Utilities ===
 
 
 @eqx.filter_jit
-def global_parallel_forward(
-    model: CallableModule[T], batch_tuple: tuple[Array, ...]
-) -> T:
-    """Execute a batched forward pass with automatic vectorization.
+def batched_forward(
+    model: CModel,
+    embeddings: Float[Array, "batch max_len edim"],
+    intervals: Int[Array, "batch max_len 3"],
+    mask: Bool[Array, "batch max_len 2"],
+    keys: PRNGKeyArray,
+) -> Float[Array, "batch output_dim"]:
+    """Batched forward pass using vmap.
 
-    Defined at module level (outside any class) to avoid JIT recompilation issues
-    that occur when methods capture different `self` references.
-
-    Args:
-        model: An Equinox module to apply to each batch element.
-        batch_tuple: Tuple of arrays where each array's first axis is the batch
-            dimension. All arrays must have the same batch size.
-
-    Returns:
-        Model outputs stacked along the batch dimension.
-
-    Note:
-        `eqx.filter_vmap` intelligently handles Equinox's PyTree structure:
-        it preserves model parameters (non-array leaves) while vectorizing
-        over axis 0 of all array inputs.
-    """
-    return eqx.filter_vmap(model)(*batch_tuple)
-
-
-def generic_data_parallel(
-    model: CallableModule[T], data_iterator: Iterable[tuple[Array, ...]]
-) -> list[T]:
-    """Run inference with data parallelism across all available JAX devices.
-
-    Creates a 1D mesh over all devices and shards each batch along the "batch"
-    axis, distributing work evenly. Each device processes a slice of the batch
-    in parallel.
+    Processes all items in the batch in parallel via jax.vmap.
 
     Args:
-        model: An Equinox module (must be callable). The model is replicated
-            across all devices.
-        data_iterator: An iterable yielding tuples of arrays. Each tuple
-            represents one batch of inputs to the model. Arrays in the tuple
-            should have shape (batch_size, ...).
+        model: CModel to apply.
+        embeddings: Padded embeddings (batch, max_len, edim).
+        intervals: Padded intervals (batch, max_len, 3).
+        mask: Padding mask (batch, max_len, 2). True = masked.
+        keys: PRNG keys for each item in batch.
 
     Returns:
-        List of outputs, one per batch from the iterator. Each output has the
-        same structure as `model(*batch_tuple)` would return.
-
-    Example:
-        >>> model = MyEquinoxModel(key=jax.random.key(0))
-        >>> data = [(x_batch, y_batch) for x_batch, y_batch in dataloader]
-        >>> outputs = generic_data_parallel(model, data)
+        Batch embeddings of shape (batch, output_dim).
     """
-    devices = jax.devices()
-    print(f"Using {len(devices)} devices: {str(devices)}")
-    mesh = Mesh(devices, axis_names=("batch",))
-    data_sharding = NamedSharding(mesh, P("batch"))
 
-    results: list[T] = []
+    def forward_one(
+        emb: Float[Array, "max_len edim"],
+        ivs: Int[Array, "max_len 3"],
+        m: Bool[Array, "max_len 2"],
+        k: PRNGKeyArray,
+    ) -> Float[Array, "output_dim"]:
+        return model(emb, ivs, mask=m, key=k)
 
-    with mesh:
-        for batch_tuple in data_iterator:
-            # Shard inputs across devices along the batch axis
-            sharded_batch = tuple(jax.device_put(x, data_sharding) for x in batch_tuple)
+    return jax.vmap(forward_one)(embeddings, intervals, mask, keys)
 
-            # Run the JIT-compiled, vmapped forward pass
-            output = global_parallel_forward(model, sharded_batch)
-            results.append(output)
 
-    return results
+# === High-Level Inference API ===
+
+
+def embed_batch(
+    model: CModel,
+    embeddings_list: Sequence[NDArray[np.generic]],
+    intervals_list: Sequence[NDArray[np.generic]],
+    shard: jax.NamedSharding | None = None,
+    num_devices: int | None = None,
+) -> Float[Array, "batch output_dim"]:
+    """Embed a batch of BED files. Handles padding internally.
+
+    Runs inference on a batch of BED files, padding to uniform length
+    and applying the model in parallel via vmap.
+
+    Args:
+        model: CModel in inference mode (should have dropout disabled).
+        embeddings_list: List of embedding arrays, each (n_i, seq_dim).
+        intervals_list: List of interval arrays, each (n_i, 3).
+
+    Returns:
+        Batch embeddings of shape (batch_size, output_dim).
+    """
+
+    real_batch_size = len(embeddings_list)
+    num_devices = len(jax.devices()) if num_devices is None else num_devices
+
+    # Pad to uniform length with device alignment
+    padded_emb, padded_ivs, mask = pad_batch(
+        embeddings_list, intervals_list, num_devices
+    )
+
+    if shard is None:
+        # Apply sharding to distribute the batch across GPUs
+        mesh = create_device_mesh()
+        shard = batch_sharding(mesh)
+
+    padded_emb_jax = jax.device_put(jnp.asarray(padded_emb), shard)
+    padded_ivs_jax = jax.device_put(jnp.asarray(padded_ivs), shard)
+    mask_jax = jax.device_put(jnp.asarray(mask), shard)
+
+    batch_size = padded_emb_jax.shape[0]
+    dummy_keys = jax.random.split(jax.random.key(0), batch_size)
+
+    embeddings = batched_forward(
+        model, padded_emb_jax, padded_ivs_jax, mask_jax, dummy_keys
+    )
+
+    return embeddings[:real_batch_size]
+
+
+def embed_dataset(
+    model: CModel,
+    bed_data: list[BedFileData],
+    batch_size: int = 64,
+) -> Float[Array, "n_files output_dim"]:
+    """Embed entire dataset efficiently in batches.
+
+    Processes all BED files in the dataset in batches for memory efficiency.
+
+    Args:
+        model: CModel (will be put in inference mode).
+        bed_data: List of BedFileData objects.
+        batch_size: Number of files to process per batch.
+
+    Returns:
+        Embeddings for all files, shape (n_files, output_dim).
+    """
+    model = eqx.nn.inference_mode(model)
+
+    mesh = create_device_mesh()
+    shard = batch_sharding(mesh)
+
+    all_embeddings = []
+    n_files = len(bed_data)
+
+    for start in range(0, n_files, batch_size):
+        end = min(start + batch_size, n_files)
+        batch_bed_data = bed_data[start:end]
+
+        # Extract embeddings and intervals
+        embeddings_list = [bd.embeddings for bd in batch_bed_data]
+        intervals_list = [bd.intervals for bd in batch_bed_data]
+
+        # Embed batch
+        batch_embeddings = embed_batch(
+            model,
+            embeddings_list,
+            intervals_list,
+            shard=shard,
+        )
+        all_embeddings.append(batch_embeddings)
+
+    # Concatenate all batches
+    return jnp.concatenate(all_embeddings, axis=0)

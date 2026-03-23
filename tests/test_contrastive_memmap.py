@@ -13,8 +13,7 @@ from giggleml.data.contrastive_memmap import (
     ContrastiveMemmapData,
     ContrastiveMemmapMetadata,
 )
-from giggleml.train.contrastive_data_loader import ContrastiveDataLoader
-from giggleml.train.similarity_graph.similarity_graph import SimilarityGraph
+from giggleml.train.contrastive_data_loader import BedFileCache
 
 
 class TestContrastiveMemmapMetadata:
@@ -208,8 +207,8 @@ class TestContrastiveMemmapData:
         assert memmap.metadata.offsets == [0, 10, 35]
 
 
-class TestContrastiveDataLoaderWithMemmap:
-    """Tests for ContrastiveDataLoader using memmap storage."""
+class TestBedFileCacheWithMemmap:
+    """Tests for BedFileCache using memmap storage."""
 
     @pytest.fixture
     def memmap_setup(self, tmp_path):
@@ -243,52 +242,34 @@ class TestContrastiveDataLoaderWithMemmap:
             output_dir=memmap_dir,
         )
 
-        # Create a minimal graph
-        matrix = np.array(
-            [
-                [0.0, 0.5, 0.3],
-                [0.5, 0.0, 0.7],
-                [0.3, 0.7, 0.0],
-            ],
-            dtype=np.float32,
-        )
-        graph = SimilarityGraph(matrix, thresholds=[0.4])
-
         return {
             "embedding_dir": embedding_dir,
             "bed_dir": bed_dir,
             "memmap_dir": memmap_dir,
             "bed_names": bed_names,
-            "graph": graph,
         }
 
-    def test_loader_with_memmap_produces_same_data(self, memmap_setup):
-        """ContrastiveDataLoader with memmap should produce same data as without."""
-        # Loader without memmap
-        loader_no_memmap = ContrastiveDataLoader(
-            graph=memmap_setup["graph"],
+    def test_cache_with_memmap_produces_same_data(self, memmap_setup):
+        """BedFileCache with memmap should produce same data as without."""
+        # Cache without memmap
+        cache_no_memmap = BedFileCache(
             bed_names=memmap_setup["bed_names"],
             embedding_dir=memmap_setup["embedding_dir"],
             bed_dir=memmap_setup["bed_dir"],
-            num_anchors=2,
-            neighbors_per_anchor=1,
         )
 
-        # Loader with memmap
-        loader_with_memmap = ContrastiveDataLoader(
-            graph=memmap_setup["graph"],
+        # Cache with memmap
+        cache_with_memmap = BedFileCache(
             bed_names=memmap_setup["bed_names"],
             embedding_dir=memmap_setup["embedding_dir"],
             bed_dir=memmap_setup["bed_dir"],
-            num_anchors=2,
-            neighbors_per_anchor=1,
             memmap_dir=memmap_setup["memmap_dir"],
         )
 
-        # Load same file with both loaders
+        # Load same file with both caches
         for idx in range(3):
-            data_no_memmap = loader_no_memmap._load_bed_uncached(idx)
-            data_with_memmap = loader_with_memmap._load_bed_uncached(idx)
+            data_no_memmap = cache_no_memmap._load_uncached(idx)
+            data_with_memmap = cache_with_memmap._load_uncached(idx)
 
             assert data_no_memmap.node_idx == data_with_memmap.node_idx
             assert data_no_memmap.embeddings.shape == data_with_memmap.embeddings.shape
@@ -305,34 +286,28 @@ class TestContrastiveDataLoaderWithMemmap:
                 data_with_memmap.intervals,
             )
 
-    def test_loader_memmap_bed_names_mismatch_raises(self, memmap_setup):
-        """ContrastiveDataLoader should raise error if bed_names don't match memmap."""
+    def test_cache_memmap_bed_names_mismatch_raises(self, memmap_setup):
+        """BedFileCache should raise error if bed_names don't match memmap."""
         with pytest.raises(ValueError, match="bed_names mismatch"):
-            ContrastiveDataLoader(
-                graph=memmap_setup["graph"],
+            BedFileCache(
                 bed_names=["bed0", "bed1", "different_name"],  # Wrong name
                 embedding_dir=memmap_setup["embedding_dir"],
                 bed_dir=memmap_setup["bed_dir"],
-                num_anchors=2,
-                neighbors_per_anchor=1,
                 memmap_dir=memmap_setup["memmap_dir"],
             )
 
-    def test_loader_memmap_validates_sorted_order(self, memmap_setup):
-        """ContrastiveDataLoader should validate sorted bed_names match memmap."""
+    def test_cache_memmap_validates_sorted_order(self, memmap_setup):
+        """BedFileCache should validate sorted bed_names match memmap."""
         # This should work because bed_names are sorted internally
-        loader = ContrastiveDataLoader(
-            graph=memmap_setup["graph"],
+        cache = BedFileCache(
             bed_names=["bed2", "bed0", "bed1"],  # Unsorted input
             embedding_dir=memmap_setup["embedding_dir"],
             bed_dir=memmap_setup["bed_dir"],
-            num_anchors=2,
-            neighbors_per_anchor=1,
             memmap_dir=memmap_setup["memmap_dir"],
         )
 
         # Should have sorted internally and match memmap
-        assert loader.bed_names == ["bed0", "bed1", "bed2"]
+        assert cache.bed_names == ["bed0", "bed1", "bed2"]
 
 
 class TestContrastiveMemmapErrors:

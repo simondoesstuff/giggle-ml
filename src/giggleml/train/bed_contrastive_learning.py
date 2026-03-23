@@ -17,7 +17,7 @@ Training uses bf16 precision and data parallel sharding across all GPUs.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,115 +27,33 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from numpy.typing import NDArray
 from tqdm import tqdm
 
 from giggleml.data.similarity_matrix import SimilarityMatrix
+
+# Import shared utilities from inference module
+from giggleml.inference.equinox_inference import pad_batch, pad_to_multiple
 from giggleml.models.cmodel import CModel, create_cmodel
 from giggleml.train.contrastive_data_loader import (
+    BedFileCache,
     ContrastiveBatch,
     ContrastiveDataLoader,
 )
 from giggleml.train.similarity_graph.similarity_graph import SimilarityGraph
-from giggleml.utils.equinox import save_checkpoint, to_bf16, to_f32
+from giggleml.utils.equinox import (
+    batch_sharding,
+    create_device_mesh,
+    replicated_sharding,
+    save_checkpoint,
+    shard_model,
+    to_bf16,
+)
 from giggleml.utils.file_utils import Pathish
 from giggleml.utils.terminal_plot import TerminalLossPlotter
 
-# === Sharding Utilities ===
-
-
-def create_device_mesh() -> Mesh:
-    """Create a 1D device mesh across all available devices."""
-    devices = jax.devices()
-    return Mesh(np.array(devices), axis_names=("batch",))
-
-
-def replicated_sharding(mesh: Mesh) -> NamedSharding:
-    """Create sharding spec for replicated data (model params)."""
-    return NamedSharding(mesh, P())
-
-
-def batch_sharding(mesh: Mesh) -> NamedSharding:
-    """Create sharding spec for batch-sharded data."""
-    return NamedSharding(mesh, P("batch"))
-
-
-def shard_model(model: CModel, sharding: NamedSharding) -> CModel:
-    """Shard model arrays while preserving non-array leaves (functions, static fields)."""
-    arrays, non_arrays = eqx.partition(model, eqx.is_array)
-    arrays = jax.device_put(arrays, sharding)
-    return eqx.combine(arrays, non_arrays)
-
-
-# === Batch Padding Utilities ===
-
-
-def _next_power_of_two(n: int) -> int:
-    """Return the smallest power of two >= n."""
-    if n <= 1:
-        return 1
-    return 1 << (n - 1).bit_length()
-
-
-def _pad_to_multiple(n: int, divisor: int) -> int:
-    """Round n up to the nearest multiple of divisor."""
-    return ((n + divisor - 1) // divisor) * divisor
-
-
-def pad_batch(
-    embeddings_list: Sequence[NDArray[np.generic]],
-    intervals_list: Sequence[NDArray[np.generic]],
-    num_devices: int = 1,
-) -> tuple[
-    NDArray[np.generic],
-    NDArray[np.int32],
-    NDArray[np.bool_],
-]:
-    """Pad variable-length BED data to next power-of-two length for batched processing.
-
-    Takes numpy arrays (host memory) and returns numpy arrays. Caller should use
-    jax.device_put() to transfer to device with appropriate sharding - this allows
-    a single host->device transfer without intermediate GPU allocations.
-
-    Padding to powers of two enables better JIT cache reuse and allows XLA to
-    apply more automatic optimizations. Batch dimension is padded to be divisible
-    by num_devices for sharding.
-
-    Args:
-        embeddings_list: List of numpy embedding arrays, each (n_i, edim).
-        intervals_list: List of numpy interval arrays, each (n_i, 3).
-        num_devices: Number of devices for batch sharding. Batch size will be
-            padded to a multiple of this.
-
-    Returns:
-        Tuple of numpy arrays (caller transfers to device):
-        - Padded embeddings: (batch, pad_len, edim) where pad_len is next power of 2
-        - Padded intervals: (batch, pad_len, 3)
-        - Mask: (batch, pad_len, 2) where True = masked (padded position)
-    """
-    real_batch_size = len(embeddings_list)
-    batch_size = _pad_to_multiple(real_batch_size, num_devices)
-    max_len = max(emb.shape[0] for emb in embeddings_list)
-    pad_len = _next_power_of_two(max_len)
-    edim = embeddings_list[0].shape[1]
-
-    # Build padded arrays in numpy (CPU) - caller transfers to device
-    padded_emb = np.zeros((batch_size, pad_len, edim), dtype=embeddings_list[0].dtype)
-    padded_ivs = np.zeros((batch_size, pad_len, 3), dtype=np.int32)
-    # Mask: True = masked/padded, starts all True
-    mask = np.ones((batch_size, pad_len, 2), dtype=np.bool_)
-
-    # Fill in actual data and unmask valid positions
-    for i, (emb, ivs) in enumerate(zip(embeddings_list, intervals_list)):
-        n = emb.shape[0]
-        padded_emb[i, :n] = emb
-        padded_ivs[i, :n] = ivs
-        mask[i, :n] = False
-
-    return padded_emb, padded_ivs, mask
+# === Training-Specific Utilities ===
 
 
 def pad_adjacency(
@@ -148,7 +66,7 @@ def pad_adjacency(
     Padded entries are set to 0 (no edge), so they contribute 0 weight to loss.
     """
     real_batch = adjacency.shape[0]
-    padded_batch = _pad_to_multiple(real_batch, num_devices)
+    padded_batch = pad_to_multiple(real_batch, num_devices)
     if padded_batch == real_batch:
         return adjacency
     padded = np.zeros((padded_batch, padded_batch), dtype=np.int32)
@@ -482,7 +400,11 @@ def train_step(
 
     # Apply input dropout inside JIT to avoid memory leaks from traced ops outside JIT
     mask = apply_input_dropout(
-        mask, input_dropout_seq, input_dropout_interval, input_dropout_both, input_dropout_key
+        mask,
+        input_dropout_seq,
+        input_dropout_interval,
+        input_dropout_both,
+        input_dropout_key,
     )
 
     def loss_fn(model: CModel) -> Float[Array, ""]:
@@ -590,6 +512,7 @@ def train(
     bed_names: list[str],
     key: PRNGKeyArray,
     *,
+    cache: BedFileCache | None = None,
     train_indices: list[int] | None = None,
     val_indices: list[int] | None = None,
     log_every: int = 100,
@@ -597,6 +520,8 @@ def train(
     checkpoint_every: int | None = None,
     checkpoint_dir: Path | None = None,
     plot_loss: bool = False,
+    eval_callbacks: list[tuple[str, Callable[[CModel], float]]] | None = None,
+    eval_every: int = 1000,
 ) -> CModel:
     """Train CModel with contrastive learning using bf16 and data parallelism.
 
@@ -609,6 +534,8 @@ def train(
         bed_names: Ordered list of BED file names matching graph node indices.
             Should not include suffix.
         key: JAX PRNG key.
+        cache: Optional pre-created BedFileCache. If None, creates one internally.
+            Pass a shared cache to avoid duplicate loading when using eval_callbacks.
         train_indices: Indices into bed_names for training set. If None, uses all.
         val_indices: Indices into bed_names for validation set. If None, skips validation.
         log_every: Log loss every N steps.
@@ -616,9 +543,13 @@ def train(
         checkpoint_every: Save checkpoint every N steps (None to disable).
         checkpoint_dir: Directory to save checkpoints (required if checkpoint_every is set).
         plot_loss: If True, display live loss plot in terminal using plotext.
+        eval_callbacks: List of callback functions for auxiliary evaluation metrics.
+            Each callback takes a CModel and returns a dict of metric name -> value.
+            Callbacks are run every eval_every steps.
+        eval_every: Run eval_callbacks every N steps.
 
     Returns:
-        Trained CModel (in f32).
+        Trained CModel
     """
     key, model_key, data_key, train_key, val_key = jax.random.split(key, 5)
 
@@ -675,18 +606,23 @@ def train(
     edge_type_weights = jnp.array(config.bin_weights, dtype=jnp.float32)
     edge_type_weights = jax.device_put(edge_type_weights, replicate)
 
-    # Create training data loader
-    # Pass full bed_names with index_map for memmap compatibility
+    # Create or use provided cache (shared between train/val/eval)
+    if cache is None:
+        cache = BedFileCache(
+            bed_names=bed_names,
+            embedding_dir=config.embedding_dir,
+            bed_dir=config.bed_dir,
+            memmap_dir=config.memmap_dir,
+            preload=True,
+        )
+
+    # Create training data loader using shared cache
     train_loader = ContrastiveDataLoader(
+        cache=cache,
         graph=graph,
-        bed_names=bed_names,
-        embedding_dir=config.embedding_dir,
-        bed_dir=config.bed_dir,
         num_anchors=config.num_anchors,
         neighbors_per_anchor=config.neighbors_per_anchor,
         max_intervals=config.max_intervals,
-        preload=True,
-        memmap_dir=config.memmap_dir,
         index_map=train_indices,
     )
 
@@ -696,15 +632,11 @@ def train(
         val_sim = _subset_similarity_matrix(similarity_matrix, val_indices)
         val_graph = SimilarityGraph(val_sim, list(config.bin_thresholds))
         val_loader = ContrastiveDataLoader(
+            cache=cache,
             graph=val_graph,
-            bed_names=bed_names,
-            embedding_dir=config.embedding_dir,
-            bed_dir=config.bed_dir,
             num_anchors=config.num_anchors,
             neighbors_per_anchor=config.neighbors_per_anchor,
             max_intervals=config.max_intervals,
-            preload=True,
-            memmap_dir=config.memmap_dir,
             index_map=val_indices,
         )
 
@@ -787,18 +719,28 @@ def train(
                 plotter.add_val_loss(step, float(val_loss))
                 plotter.plot()
 
+        # Evaluation callbacks
+        if eval_callbacks and step % eval_every == 0 and step > 0:
+            eval_model = eqx.nn.inference_mode(model)
+            for name, callback in eval_callbacks:
+                value = callback(eval_model)
+                tqdm.write(f"Step {step}: {name} = {value:.4f}")
+                if plotter:
+                    plotter.add_aux_metric(name, step, value)
+            if plotter:
+                plotter.plot()
+
         if checkpoint_every and checkpoint_dir and (step + 1) % checkpoint_every == 0:
             ckpt_path = checkpoint_dir / f"model_step_{step + 1}.eqx"
-            # Convert back to f32 for checkpointing
-            save_checkpoint(to_f32(model), ckpt_path)
+            save_checkpoint(model, ckpt_path)
             tqdm.write(f"Saved checkpoint: {ckpt_path}")
 
-    # Save final checkpoint (in f32)
+    # Save final checkpoint
     if checkpoint_dir:
         final_path = checkpoint_dir / f"model_step_{config.total_steps}.eqx"
         if not final_path.exists():
-            save_checkpoint(to_f32(model), final_path)
+            save_checkpoint(model, final_path)
             tqdm.write(f"Saved final checkpoint: {final_path}")
 
-    # Return model in f32
-    return to_f32(model)
+    # Return model
+    return model
