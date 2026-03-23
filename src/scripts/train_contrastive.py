@@ -42,7 +42,7 @@ CONFIG = ContrastiveTrainingConfig(
     output_dim=128,
     cross_attn_chunk_size=4096,
     # Training
-    peak_learning_rate=1e-3,
+    peak_learning_rate=2e-3,
     weight_decay=0.01,
     warmup_steps=1500,
     total_steps=50_000,
@@ -72,9 +72,9 @@ CONFIG = ContrastiveTrainingConfig(
 SEED = 42
 
 # === Logging ===
-LOG_EVERY = 20
+LOG_EVERY = 30
 VAL_EVERY = 200
-CHECKPOINT_EVERY = None
+CHECKPOINT_EVERY = 2500
 PLOT_LOSS = True  # Show live loss plot in terminal
 
 # === Train/Test/Val Split ===
@@ -82,7 +82,7 @@ TEST_FRACTION = 0.1
 VAL_FRACTION = 0.1
 
 # === nDCG Evaluation ===
-EVAL_EVERY = 1  # Run nDCG evaluation every N steps
+EVAL_EVERY = 1000  # Run nDCG evaluation every N steps
 NDCG_K = 10  # Top-K for nDCG metric
 
 
@@ -152,7 +152,6 @@ def main() -> None:
     )
 
     # Create nDCG evaluation callback using shared cache
-    effective_batch_size = CONFIG.num_anchors * (CONFIG.neighbors_per_anchor + 1)
     all_bed_data = cache.get_all()
     ndcg_callback = create_ndcg_callback(
         bed_data=all_bed_data,

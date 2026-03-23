@@ -43,10 +43,13 @@ from giggleml.train.contrastive_data_loader import (
 )
 from giggleml.train.similarity_graph.similarity_graph import SimilarityGraph
 from giggleml.utils.equinox import (
+    TrainState,
     batch_sharding,
     create_device_mesh,
+    load_train_state,
     replicated_sharding,
     save_checkpoint,
+    save_train_state,
     shard_model,
     to_bf16,
 )
@@ -519,6 +522,7 @@ def train(
     val_every: int = 500,
     checkpoint_every: int | None = None,
     checkpoint_dir: Path | None = None,
+    resume_from: Path | None = None,
     plot_loss: bool = False,
     eval_callbacks: list[tuple[str, Callable[[CModel], float]]] | None = None,
     eval_every: int = 1000,
@@ -541,7 +545,10 @@ def train(
         log_every: Log loss every N steps.
         val_every: Compute validation loss every N steps (requires val_indices).
         checkpoint_every: Save checkpoint every N steps (None to disable).
-        checkpoint_dir: Directory to save checkpoints (required if checkpoint_every is set).
+        checkpoint_dir: Directory to save checkpoints. If not provided but resume_from is,
+            inferred as resume_from.parent.
+        resume_from: Path to checkpoint directory to resume from. If provided, training
+            continues from the saved step with restored model, optimizer state, and PRNG keys.
         plot_loss: If True, display live loss plot in terminal using plotext.
         eval_callbacks: List of callback functions for auxiliary evaluation metrics.
             Each callback takes a CModel and returns a dict of metric name -> value.
@@ -572,35 +579,78 @@ def train(
     train_sim = _subset_similarity_matrix(similarity_matrix, train_indices)
     graph = SimilarityGraph(train_sim, list(config.bin_thresholds))
 
-    # Create model with interval encoding mode
-    model = create_cmodel(
-        seq_dim=config.seq_dim,
-        latent_dim=config.latent_dim,
-        num_latents=config.num_latents,
-        shared_per_stack=config.shared_per_stack,
-        num_stacks=config.num_stacks,
-        num_heads=config.num_heads,
-        output_dim=config.output_dim,
-        dropout_rate=config.dropout_rate,
-        pooling="decode",
-        cross_attn_chunk_size=config.cross_attn_chunk_size,
-        cross_attn_checkpoint=True,
-        key=model_key,
-    )
-
-    # Filter for only floating-point arrays (inexact arrays)
-    trainable_parts = eqx.filter(model, eqx.is_inexact_array)
-    trainable_params = sum(x.size for x in jax.tree_util.tree_leaves(trainable_parts))
-    print(f"Built CModel, Trainable parameters: {trainable_params:,}")
-
-    # Convert model to bf16 and replicate across devices
-    model = to_bf16(model)
-    model = shard_model(model, replicate)
-
-    # Create optimizer (operates on bf16 params)
+    # Create optimizer (needed for both fresh and resumed training)
     optimizer = create_optimizer(config)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
-    opt_state = jax.device_put(opt_state, replicate)
+
+    # Infer checkpoint_dir from resume_from if not provided
+    if resume_from is not None and checkpoint_dir is None:
+        checkpoint_dir = resume_from.parent
+
+    # Initialize or resume training state
+    start_step = 0
+    if resume_from is not None:
+        # Resume from checkpoint - create template model for deserialization
+        model_template = create_cmodel(
+            seq_dim=config.seq_dim,
+            latent_dim=config.latent_dim,
+            num_latents=config.num_latents,
+            shared_per_stack=config.shared_per_stack,
+            num_stacks=config.num_stacks,
+            num_heads=config.num_heads,
+            output_dim=config.output_dim,
+            dropout_rate=config.dropout_rate,
+            pooling="decode",
+            cross_attn_chunk_size=config.cross_attn_chunk_size,
+            cross_attn_checkpoint=True,
+            key=model_key,
+        )
+        # Create template opt_state for deserialization
+        model_bf16 = to_bf16(model_template)
+        opt_state_template = optimizer.init(eqx.filter(model_bf16, eqx.is_array))
+
+        # Load saved state
+        saved_state = load_train_state(resume_from, model_template, opt_state_template)
+        start_step = saved_state.step
+        train_key = saved_state.train_key
+        data_key = saved_state.data_key
+
+        # Convert loaded model to bf16 and shard
+        model = to_bf16(saved_state.model)
+        model = shard_model(model, replicate)
+        opt_state = jax.device_put(saved_state.opt_state, replicate)
+
+        print(f"Resumed from checkpoint at step {start_step}")
+    else:
+        # Fresh training - create model from scratch
+        model = create_cmodel(
+            seq_dim=config.seq_dim,
+            latent_dim=config.latent_dim,
+            num_latents=config.num_latents,
+            shared_per_stack=config.shared_per_stack,
+            num_stacks=config.num_stacks,
+            num_heads=config.num_heads,
+            output_dim=config.output_dim,
+            dropout_rate=config.dropout_rate,
+            pooling="decode",
+            cross_attn_chunk_size=config.cross_attn_chunk_size,
+            cross_attn_checkpoint=True,
+            key=model_key,
+        )
+
+        # Filter for only floating-point arrays (inexact arrays)
+        trainable_parts = eqx.filter(model, eqx.is_inexact_array)
+        trainable_params = sum(
+            x.size for x in jax.tree_util.tree_leaves(trainable_parts)
+        )
+        print(f"Built CModel, Trainable parameters: {trainable_params:,}")
+
+        # Convert model to bf16 and replicate across devices
+        model = to_bf16(model)
+        model = shard_model(model, replicate)
+
+        # Initialize optimizer state
+        opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+        opt_state = jax.device_put(opt_state, replicate)
 
     # Edge type weights (replicated)
     edge_type_weights = jnp.array(config.bin_weights, dtype=jnp.float32)
@@ -652,7 +702,12 @@ def train(
     batch_iter = train_loader.iter_batches(data_key)
     val_batch_iter = val_loader.iter_batches(val_key) if val_loader else None
 
-    for step in tqdm(range(config.total_steps), desc="Training"):
+    for step in tqdm(
+        range(start_step, config.total_steps),
+        desc="Training",
+        initial=start_step,
+        total=config.total_steps,
+    ):
         train_key, step_key = jax.random.split(train_key)
         batch = next(batch_iter)
         embeddings_batch, intervals_batch = _extract_batch_data(batch)
@@ -731,9 +786,17 @@ def train(
                 plotter.plot()
 
         if checkpoint_every and checkpoint_dir and (step + 1) % checkpoint_every == 0:
-            ckpt_path = checkpoint_dir / f"model_step_{step + 1}.eqx"
-            save_checkpoint(model, ckpt_path)
-            tqdm.write(f"Saved checkpoint: {ckpt_path}")
+            # Save full training state for resumption
+            state_dir = checkpoint_dir / f"state_step_{step + 1}"
+            train_state = TrainState(
+                step=step + 1,
+                model=model,
+                opt_state=opt_state,
+                train_key=train_key,
+                data_key=data_key,
+            )
+            save_train_state(train_state, state_dir)
+            tqdm.write(f"Saved checkpoint: {state_dir}")
 
     # Save final checkpoint
     if checkpoint_dir:
