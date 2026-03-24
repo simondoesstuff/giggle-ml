@@ -106,8 +106,10 @@ class TerminalLossPlotter:
             # Use subplots: loss on top, each aux metric below
             n_plots = 1 + len(aux_with_data)
             plt.subplots(n_plots, 1)
+            plt.plotsize(self.width, self.height * n_plots)
 
             # Plot 1: Loss curves
+            # Note: must use plt.* after subplot(), not chained calls on subplot return
             plt.subplot(1, 1)
             if self._train_steps:
                 plt.plot(
@@ -136,10 +138,9 @@ class TerminalLossPlotter:
                     marker="braille",
                 )
                 plt.ylabel(name)
-
-            # Only show xlabel on bottom plot
-            plt.xlabel("Step")
-            plt.plotsize(self.width, self.height * n_plots)
+                # Only show xlabel on bottom plot
+                if i == n_plots:
+                    plt.xlabel("Step")
         else:
             # Single plot for loss only
             if self._train_steps:

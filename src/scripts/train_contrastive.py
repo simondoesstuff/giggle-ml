@@ -27,7 +27,7 @@ rme = Path("data/roadmap_epigenomics")
 BED_DIR = rme / "beds"
 EMBEDDING_DIR = rme / "embeds"
 SIMILARITY_MATRIX_PATH = rme / "giggle_similarity.mat"
-CHECKPOINT_DIR = Path("data/checkpoints/cmodel_2026-3-22")
+CHECKPOINT_DIR = Path("data/checkpoints/cmodel_2026-3-23")
 MEMMAP_DIR: Path | None = rme / "contrastive_memmap"
 
 # === Training Configuration ===
@@ -42,7 +42,7 @@ CONFIG = ContrastiveTrainingConfig(
     output_dim=128,
     cross_attn_chunk_size=4096,
     # Training
-    peak_learning_rate=2e-3,
+    peak_learning_rate=7e-4,
     weight_decay=0.01,
     warmup_steps=1500,
     total_steps=50_000,
@@ -74,7 +74,7 @@ SEED = 42
 # === Logging ===
 LOG_EVERY = 30
 VAL_EVERY = 200
-CHECKPOINT_EVERY = 2500
+CHECKPOINT_EVERY = 2000
 PLOT_LOSS = True  # Show live loss plot in terminal
 
 # === Train/Test/Val Split ===
@@ -82,7 +82,7 @@ TEST_FRACTION = 0.1
 VAL_FRACTION = 0.1
 
 # === nDCG Evaluation ===
-EVAL_EVERY = 1000  # Run nDCG evaluation every N steps
+EVAL_EVERY = 800  # Run nDCG evaluation every N steps
 NDCG_K = 10  # Top-K for nDCG metric
 
 
@@ -180,6 +180,7 @@ def main() -> None:
         val_every=VAL_EVERY,
         checkpoint_every=CHECKPOINT_EVERY,
         checkpoint_dir=CHECKPOINT_DIR,
+        resume_from=CHECKPOINT_DIR / "state_step_2500",
         plot_loss=PLOT_LOSS,
         eval_callbacks=[(f"nDCG@{NDCG_K}", ndcg_callback)],
         eval_every=EVAL_EVERY,
