@@ -11,7 +11,7 @@ tar -xzvf raw.tgz
 
 # split and rename
 #   127 cell types by 15 chromatin states gives us 1,905 files with 56,440,237 intervals.
-python ../../../src/scripts/rme_split.py "*.bed.gz" ./
+python ../../../src/analysis/rme_split.py "*.bed.gz" ./
 
 # sort with bedtools
 parallel 'bedtools sort -i "{}" > "{.}.tmp" && mv "{.}.tmp" "{}" && echo "Sorted: {}"' ::: *.bed

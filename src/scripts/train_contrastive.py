@@ -83,7 +83,7 @@ VAL_FRACTION = 0.1
 
 # === nDCG Evaluation ===
 EVAL_EVERY = 800  # Run nDCG evaluation every N steps
-NDCG_K = 10  # Top-K for nDCG metric
+NDCG_K = 100  # Top-K for nDCG metric
 
 
 def get_bed_names(bed_dir: Path) -> list[str]:
@@ -180,7 +180,7 @@ def main() -> None:
         val_every=VAL_EVERY,
         checkpoint_every=CHECKPOINT_EVERY,
         checkpoint_dir=CHECKPOINT_DIR,
-        resume_from=CHECKPOINT_DIR / "state_step_2500",
+        resume_from=CHECKPOINT_DIR / "state_step_20000",
         plot_loss=PLOT_LOSS,
         eval_callbacks=[(f"nDCG@{NDCG_K}", ndcg_callback)],
         eval_every=EVAL_EVERY,
