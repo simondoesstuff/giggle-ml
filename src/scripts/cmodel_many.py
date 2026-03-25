@@ -13,12 +13,11 @@ import equinox as eqx
 import jax
 import numpy as np
 import zarr
-from tqdm import tqdm
 
-from giggleml.inference.equinox_inference import embed_batch
+from giggleml.inference.equinox_inference import embed_dataset
 from giggleml.models.cmodel import create_cmodel
 from giggleml.train.contrastive_data_loader import BedFileCache
-from giggleml.utils.equinox import load_checkpoint
+from giggleml.utils.equinox import load_checkpoint, to_bf16
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,8 +57,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=1024,
-        help="Zarr chunk size along batch dimension (default: 1024)",
+        default=524_288,
+        help="Zarr chunk size along batch dimension (default: 524,288)",
     )
     parser.add_argument(
         "--memmap-dir",
@@ -75,18 +74,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-stacks", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--output-dim", type=int, default=128)
-    parser.add_argument("--dropout-rate", type=float, default=0)
     parser.add_argument("--cross-attn-chunk-size", type=int, default=4096)
 
     return parser.parse_args()
 
 
 def discover_bed_files(bed_dir: Path) -> list[str]:
-    """Discover all .bed.gz files in directory and return sorted names without suffix."""
-    bed_files = list(bed_dir.glob("*.bed.gz"))
-    # Extract names without .bed.gz suffix
-    names = [f.name.removesuffix(".bed.gz") for f in bed_files]
-    return sorted(names)
+    """Discover all .bed and .bed.gz files in directory and return sorted names without suffix."""
+    # Find both extensions by combining the glob results
+    bed_files = list(bed_dir.glob("*.bed.gz")) + list(bed_dir.glob("*.bed"))
+    # Extract names by sequentially stripping possible suffixes
+    names = [f.name.removesuffix(".bed.gz").removesuffix(".bed") for f in bed_files]
+    # Use set() to ensure we don't return duplicates if both formats exist for the same name, then sort
+    return sorted(list(set(names)))
 
 
 def main() -> None:
@@ -107,7 +107,7 @@ def main() -> None:
         num_stacks=args.num_stacks,
         num_heads=args.num_heads,
         output_dim=args.output_dim,
-        dropout_rate=args.dropout_rate,
+        dropout_rate=0,
         pooling="decode",
         cross_attn_chunk_size=args.cross_attn_chunk_size,
         cross_attn_checkpoint=True,
@@ -116,7 +116,8 @@ def main() -> None:
 
     # Load checkpoint
     print(f"Loading checkpoint from {args.checkpoint}")
-    model = load_checkpoint(args.checkpoint, model_template)
+    model = to_bf16(load_checkpoint(args.checkpoint, model_template))
+    # embed_dataset also sets inference mode, but we can do it here explicitly
     model = eqx.nn.inference_mode(model)
     print("Model loaded")
 
@@ -133,23 +134,15 @@ def main() -> None:
     # Get all bed data in sorted order (cache sorts bed_names internally)
     bed_data = cache.get_all()
 
-    # Embed in batches
+    # Embed using the high-level inference API
     print(f"Embedding {len(bed_data)} files in batches of {args.batch_size}...")
-    all_embeddings = []
 
-    for start in tqdm(range(0, len(bed_data), args.batch_size), desc="Embedding"):
-        end = min(start + args.batch_size, len(bed_data))
-        batch = bed_data[start:end]
+    embeddings_jax = embed_dataset(
+        model=model, bed_data=bed_data, batch_size=args.batch_size, use_tqdm=True
+    )
 
-        embeddings_list = [bd.embeddings for bd in batch]
-        intervals_list = [bd.intervals for bd in batch]
-
-        batch_embeddings = embed_batch(model, embeddings_list, intervals_list)
-        # Move to CPU as numpy
-        all_embeddings.append(np.asarray(batch_embeddings))
-
-    # Concatenate all embeddings
-    embeddings_array = np.concatenate(all_embeddings, axis=0)
+    # Convert jax array back to numpy for Zarr writing
+    embeddings_array = np.asarray(embeddings_jax)
     print(f"Final embeddings shape: {embeddings_array.shape}")
 
     # Write to zarr with large chunk size
@@ -175,5 +168,6 @@ def main() -> None:
     print(f"Done! Wrote {len(bed_names)} embeddings to {args.output}")
 
 
+# uv run src/scripts/cmodel_many.py --checkpoint data/checkpoints/cmodel_2026-3-23/state_step_20000/model.eqx --bed-dir data/roadmap_epigenomics/beds --embedding-dir data/roadmap_epigenomics/embeds/ --output data/roadmap_epigenomics/cmodel_embeds.zarr --batch-size 16 --memmap-dir data/roadmap_epigenomics/contrastive_memmap/
 if __name__ == "__main__":
     main()

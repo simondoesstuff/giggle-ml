@@ -14,12 +14,11 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, PRNGKeyArray
 
-from giggleml.models.cmodel import CModel
 from giggleml.utils.file_utils import Pathish
 
 
 @dataclass
-class TrainState:
+class TrainState[T]:
     """Complete training state for resumable training.
 
     Attributes:
@@ -31,7 +30,7 @@ class TrainState:
     """
 
     step: int
-    model: CModel
+    model: T
     opt_state: optax.OptState
     train_key: PRNGKeyArray
     data_key: PRNGKeyArray
@@ -85,7 +84,7 @@ def load_checkpoint[T](path: Pathish, model_template: T) -> T:
     return eqx.tree_deserialise_leaves(Path(path), model_template)
 
 
-def save_train_state(state: TrainState, directory: Pathish) -> None:
+def save_train_state[T](state: TrainState[T], directory: Pathish) -> None:
     """Save complete training state for resumable training.
 
     Creates a directory containing:
@@ -118,11 +117,11 @@ def save_train_state(state: TrainState, directory: Pathish) -> None:
         json.dump(metadata, f, indent=2)
 
 
-def load_train_state(
+def load_train_state[T](
     directory: Pathish,
-    model_template: CModel,
+    model_template: T,
     opt_state_template: optax.OptState,
-) -> TrainState:
+) -> TrainState[T]:
     """Load complete training state for resuming training.
 
     Args:
@@ -148,8 +147,12 @@ def load_train_state(
         metadata = json.load(f)
 
     step = metadata["step"]
-    train_key = jax.random.wrap_key_data(jnp.array(metadata["train_key"], dtype=jnp.uint32))
-    data_key = jax.random.wrap_key_data(jnp.array(metadata["data_key"], dtype=jnp.uint32))
+    train_key = jax.random.wrap_key_data(
+        jnp.array(metadata["train_key"], dtype=jnp.uint32)
+    )
+    data_key = jax.random.wrap_key_data(
+        jnp.array(metadata["data_key"], dtype=jnp.uint32)
+    )
 
     return TrainState(
         step=step,
@@ -179,7 +182,7 @@ def batch_sharding(mesh: Mesh) -> NamedSharding:
     return NamedSharding(mesh, P("batch"))
 
 
-def shard_model(model: CModel, sharding: NamedSharding) -> CModel:
+def shard_model[T](model: T, sharding: NamedSharding) -> T:
     """Shard model arrays while preserving non-array leaves (functions, static fields)."""
     arrays, non_arrays = eqx.partition(model, eqx.is_array)
     arrays = jax.device_put(arrays, sharding)

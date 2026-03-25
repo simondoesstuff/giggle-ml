@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from numpy.typing import NDArray
+from tqdm import tqdm
 
 from giggleml.models.cmodel import CModel
 from giggleml.train.contrastive_data_loader import BedFileData
@@ -179,6 +180,7 @@ def embed_dataset(
     model: CModel,
     bed_data: list[BedFileData],
     batch_size: int = 64,
+    use_tqdm: bool = False,
 ) -> Float[Array, "n_files output_dim"]:
     """Embed entire dataset efficiently in batches.
 
@@ -200,7 +202,9 @@ def embed_dataset(
     all_embeddings = []
     n_files = len(bed_data)
 
-    for start in range(0, n_files, batch_size):
+    for start in tqdm(
+        range(0, n_files, batch_size), desc="Embedding batches", disable=not use_tqdm
+    ):
         end = min(start + batch_size, n_files)
         batch_bed_data = bed_data[start:end]
 
