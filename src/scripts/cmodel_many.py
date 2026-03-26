@@ -17,7 +17,13 @@ import zarr
 from giggleml.inference.equinox_inference import embed_dataset
 from giggleml.models.cmodel import create_cmodel
 from giggleml.train.contrastive_data_loader import BedFileCache
-from giggleml.utils.equinox import load_checkpoint, to_bf16
+from giggleml.utils.equinox import (
+    create_device_mesh,
+    load_checkpoint,
+    replicated_sharding,
+    shard_model,
+    to_bf16,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,6 +123,11 @@ def main() -> None:
     # Load checkpoint
     print(f"Loading checkpoint from {args.checkpoint}")
     model = to_bf16(load_checkpoint(args.checkpoint, model_template))
+
+    # Place model on GPU (replicated across devices for vmap)
+    mesh = create_device_mesh()
+    model = shard_model(model, replicated_sharding(mesh))
+
     # embed_dataset also sets inference mode, but we can do it here explicitly
     model = eqx.nn.inference_mode(model)
     print("Model loaded")
