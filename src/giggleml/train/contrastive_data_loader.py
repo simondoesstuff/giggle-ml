@@ -20,7 +20,7 @@ from giggleml.train.similarity_graph.community_subgraph import (
     community_subgraph_iterator,
 )
 from giggleml.train.similarity_graph.similarity_graph import SimilarityGraph
-from giggleml.utils.file_utils import Pathish
+from giggleml.utils.file_utils import Pathish, possibly_gzipped
 
 # Type alias for numpy arrays in host memory
 type HostArray = NDArray[np.generic]
@@ -158,7 +158,7 @@ class BedFileCache:
             zarr_array = zarr.open_array(zarr_path, mode="r")
             embeddings = np.asarray(zarr_array[:], dtype=ml_dtypes.bfloat16)
 
-            bed_path = self.bed_dir / f"{name}.bed"
+            bed_path = possibly_gzipped(self.bed_dir / f"{name}.bed")
             intervals = load_bed_array(bed_path)
 
         return BedFileData(
