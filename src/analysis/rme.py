@@ -58,6 +58,44 @@ cell_categories = [
     "Blood and T-cell",
 ]
 
+# Broader category groupings
+broad_categories = [
+    "Pluripotent",
+    "Blood/Immune",
+    "Muscle/Heart",
+    "Neural",
+    "Stromal",
+    "Organ",
+    "Cancer",
+    "Other",
+]
+
+category_to_broad_map = {
+    "iPSC": "Pluripotent",
+    "ESC": "Pluripotent",
+    "ES deriv": "Pluripotent",
+    "Thymus": "Blood/Immune",
+    "HSC and B cell": "Blood/Immune",
+    "Blood and T-cell": "Blood/Immune",
+    "Sm muscle": "Muscle/Heart",
+    "Muscle": "Muscle/Heart",
+    "Heart": "Muscle/Heart",
+    "Neurosph": "Neural",
+    "Brain": "Neural",
+    "Mesench": "Stromal",
+    "Epithelial": "Stromal",
+    "Lung": "Organ",
+    "Digestive": "Organ",
+    "Cancer cell line": "Cancer",
+    "Other": "Other",
+}
+
+
+def classify_broad_category(category: str) -> str:
+    """Convert a cell category to its broader category grouping."""
+    return category_to_broad_map.get(category, "Other")
+
+
 category_keywords_map = {
     "iPSC": ["IPS"],
     "Thymus": ["THYMUS", "SPLEEN"],
