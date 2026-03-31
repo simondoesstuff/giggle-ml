@@ -24,6 +24,7 @@ from giggleml.utils.equinox import (
     shard_model,
     to_bf16,
 )
+from giggleml.utils.file_utils import file_stem, possibly_gzipped
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,11 +37,16 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to CModel checkpoint (.eqx file)",
     )
-    parser.add_argument(
+    bed_input = parser.add_mutually_exclusive_group(required=True)
+    bed_input.add_argument(
         "--bed-dir",
         type=Path,
-        required=True,
-        help="Directory containing .bed.gz files",
+        help="Directory containing .bed or .bed.gz files",
+    )
+    bed_input.add_argument(
+        "--bed-file",
+        type=Path,
+        help="Single .bed or .bed.gz file to embed",
     )
     parser.add_argument(
         "--embedding-dir",
@@ -99,10 +105,18 @@ def main() -> None:
     args = parse_args()
 
     # Discover bed files
-    bed_names = discover_bed_files(args.bed_dir)
-    if not bed_names:
-        raise ValueError(f"No .bed.gz files found in {args.bed_dir}")
-    print(f"Found {len(bed_names)} BED files")
+    if args.bed_file is not None:
+        # Single file mode - resolve .gz variant if needed
+        bed_path = possibly_gzipped(args.bed_file)
+        bed_names = [file_stem(bed_path)]
+        bed_dir = bed_path.parent
+    else:
+        # Directory mode
+        bed_names = discover_bed_files(args.bed_dir)
+        if not bed_names:
+            raise ValueError(f"No .bed or .bed.gz files found in {args.bed_dir}")
+        bed_dir = args.bed_dir
+    print(f"Found {len(bed_names)} BED file(s)")
 
     # Create template model for deserialization
     model_template = create_cmodel(
@@ -137,7 +151,7 @@ def main() -> None:
     cache = BedFileCache(
         bed_names=bed_names,
         embedding_dir=args.embedding_dir,
-        bed_dir=args.bed_dir,
+        bed_dir=bed_dir,
         memmap_dir=args.memmap_dir,
         preload=True,
     )
@@ -180,5 +194,6 @@ def main() -> None:
 
 
 # uv run src/scripts/cmodel_many.py --checkpoint data/checkpoints/cmodel_2026-3-23/state_step_20000/model.eqx --bed-dir data/roadmap_epigenomics/beds --embedding-dir data/roadmap_epigenomics/embeds/ --output data/roadmap_epigenomics/cmodel_embeds.zarr --batch-size 16 --memmap-dir data/roadmap_epigenomics/contrastive_memmap/
+# uv run src/scripts/cmodel_many.py --checkpoint data/checkpoints/cmodel_2026-3-23/state_step_20000/model.eqx --bed-file data/roadmap_epigenomics/beds/sample.bed --embedding-dir data/roadmap_epigenomics/embeds/ --output data/roadmap_epigenomics/sample_embed.zarr --batch-size 16
 if __name__ == "__main__":
     main()

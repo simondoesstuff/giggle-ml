@@ -12,10 +12,15 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from giggleml.data.fasta import load_fasta
-from giggleml.data.intervals import crop_intervals, load_bed, sorted_by_size
+from giggleml.data.intervals import (
+    crop_intervals,
+    filter_chromosomes,
+    load_bed,
+    sorted_by_size,
+)
 from giggleml.inference.torch_inference import embed_intervals
 from giggleml.models.hyena_dna import HyenaDNA
-from giggleml.utils.file_utils import Pathish, file_stem
+from giggleml.utils.file_utils import Pathish, file_stem, possibly_gzipped
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,11 +40,16 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to the reference FASTA file (.fa or .fasta)",
     )
-    parser.add_argument(
+    bed_input = parser.add_mutually_exclusive_group(required=True)
+    bed_input.add_argument(
         "--bed-dir",
         type=Path,
-        required=True,
         help="Directory containing .bed or .bed.gz files",
+    )
+    bed_input.add_argument(
+        "--bed-file",
+        type=Path,
+        help="Single .bed or .bed.gz file to embed",
     )
     parser.add_argument(
         "--output-dir",
@@ -80,7 +90,7 @@ def main(
     print(f"Loading and cropping intervals from {len(bed_paths)} BED files...")
     intervals = [
         sorted_by_size(
-            list(crop_intervals(load_bed(bed), model.seq_max)),
+            list(crop_intervals(filter_chromosomes(load_bed(bed)), model.seq_max)),
             descending=True,
         )
         for bed in bed_paths
@@ -100,18 +110,25 @@ def main(
 
 # Example execution:
 # uv run torchrun --nproc_per_node=4 src/scripts/hyena_dna_many.py --bed-dir data/beds --output-dir data/embeds --fasta data/hg/hg38.fa
+# uv run torchrun --nproc_per_node=4 src/scripts/hyena_dna_many.py --bed-file data/beds/sample.bed --output-dir data/embeds --fasta data/hg/hg38.fa
 if __name__ == "__main__":
     args = parse_args()
 
-    # Discover both .bed and .bed.gz files
-    bed_files = list(args.bed_dir.glob("*.bed.gz")) + list(args.bed_dir.glob("*.bed"))
+    if args.bed_file is not None:
+        # Single file mode - resolve .gz variant if needed
+        bed_paths = [possibly_gzipped(args.bed_file)]
+    else:
+        # Directory mode - discover both .bed and .bed.gz files
+        bed_files = list(args.bed_dir.glob("*.bed.gz")) + list(
+            args.bed_dir.glob("*.bed")
+        )
 
-    # Deduplicate in case there are identical base names
-    bed_paths = list(set(bed_files))
-    bed_paths.sort()
+        # Deduplicate in case there are identical base names
+        bed_paths = list(set(bed_files))
+        bed_paths.sort()
 
-    if not bed_paths:
-        raise ValueError(f"No .bed or .bed.gz files found in {args.bed_dir}")
+        if not bed_paths:
+            raise ValueError(f"No .bed or .bed.gz files found in {args.bed_dir}")
 
     # Convert GiB to bytes for the inference function
     vram_cap_bytes = args.vram_cap * (1024**3)

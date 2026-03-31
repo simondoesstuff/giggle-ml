@@ -1,4 +1,6 @@
+import atexit
 import gzip as gzip_module
+import warnings
 from collections.abc import Iterable, Iterator, Sequence
 
 import numpy as np
@@ -6,6 +8,21 @@ from numpy.typing import NDArray
 
 from giggleml.types import GenomicInterval
 from giggleml.utils.file_utils import Pathish, file_ext
+
+# Track chromosomes skipped due to not being in DEFAULT_CHROMOSOMES
+_skipped_chromosomes: set[str] = set()
+
+
+def _warn_skipped_chromosomes() -> None:
+    """Warn about skipped chromosomes at exit."""
+    if _skipped_chromosomes:
+        warnings.warn(
+            f"Skipped {len(_skipped_chromosomes)} unknown chromosome(s): "
+            f"{', '.join(sorted(_skipped_chromosomes))}"
+        )
+
+
+atexit.register(_warn_skipped_chromosomes)
 
 DEFAULT_CHROMOSOMES: tuple[str, ...] = (
     "chr1",
@@ -57,6 +74,29 @@ def load_bed(path: Pathish, *, gzip: bool | None = None) -> Iterator[GenomicInte
             yield fields[0], int(fields[1]), int(fields[2])
 
 
+def filter_chromosomes(
+    intervals: Iterable[GenomicInterval],
+    chromosomes: Sequence[str] = DEFAULT_CHROMOSOMES,
+) -> Iterator[GenomicInterval]:
+    """Filter intervals to only include those on known chromosomes.
+
+    Unknown chromosomes are tracked and warned about at program exit.
+
+    Args:
+        intervals: Iterable of (chrom, start, end) tuples.
+        chromosomes: Sequence of valid chromosome names.
+
+    Yields:
+        GenomicInterval tuples on known chromosomes.
+    """
+    chrom_set = set(chromosomes)
+    for iv in intervals:
+        if iv[0] in chrom_set:
+            yield iv
+        else:
+            _skipped_chromosomes.add(iv[0])
+
+
 def interval_to_array(
     interval: GenomicInterval,
     chromosomes: Sequence[str] = DEFAULT_CHROMOSOMES,
@@ -83,6 +123,9 @@ def load_bed_array(
 ) -> NDArray[np.int32]:
     """Load genomic intervals from a BED file as a numpy array.
 
+    Intervals on chromosomes not in the chromosomes list are skipped.
+    Unknown chromosomes are tracked and warned about at program exit.
+
     Args:
         path: Path to the BED file (.bed or .gz compressed).
         gzip: Whether file is gzip compressed. If None, inferred from extension.
@@ -91,9 +134,15 @@ def load_bed_array(
     Returns:
         Numpy array of shape (intervals, 3) with columns [chrom_idx, start, end].
     """
-    raw_intervals = [
-        [chromosomes.index(iv[0]), iv[1], iv[2]] for iv in load_bed(path, gzip=gzip)
-    ]
+    chrom_set = set(chromosomes)
+    raw_intervals: list[list[int]] = []
+
+    for iv in load_bed(path, gzip=gzip):
+        if iv[0] in chrom_set:
+            raw_intervals.append([chromosomes.index(iv[0]), iv[1], iv[2]])
+        else:
+            _skipped_chromosomes.add(iv[0])
+
     return np.array(raw_intervals, dtype=np.int32)
 
 
