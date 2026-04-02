@@ -88,6 +88,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dim", type=int, default=128)
     parser.add_argument("--cross-attn-chunk-size", type=int, default=4096)
 
+    # Input dropout (applied per-position during inference)
+    parser.add_argument(
+        "--seq-dropout",
+        type=float,
+        default=0.0,
+        help="Probability of masking sequence embeddings per position (default: 0.0)",
+    )
+    parser.add_argument(
+        "--interval-dropout",
+        type=float,
+        default=0.0,
+        help="Probability of masking interval encodings per position (default: 0.0)",
+    )
+    parser.add_argument(
+        "--dropout-seed",
+        type=int,
+        default=None,
+        help="Random seed for dropout reproducibility",
+    )
+
     return parser.parse_args()
 
 
@@ -161,9 +181,17 @@ def main() -> None:
 
     # Embed using the high-level inference API
     print(f"Embedding {len(bed_data)} files in batches of {args.batch_size}...")
+    if args.seq_dropout > 0 or args.interval_dropout > 0:
+        print(f"Input dropout: seq={args.seq_dropout}, interval={args.interval_dropout}")
 
     embeddings_jax = embed_dataset(
-        model=model, bed_data=bed_data, batch_size=args.batch_size, use_tqdm=True
+        model=model,
+        bed_data=bed_data,
+        batch_size=args.batch_size,
+        use_tqdm=True,
+        seq_dropout=args.seq_dropout,
+        interval_dropout=args.interval_dropout,
+        seed=args.dropout_seed,
     )
 
     # Convert jax array back to numpy for Zarr writing

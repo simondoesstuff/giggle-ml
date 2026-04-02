@@ -39,6 +39,10 @@ def pad_batch(
     embeddings_list: Sequence[NDArray[np.generic]],
     intervals_list: Sequence[NDArray[np.generic]],
     num_devices: int = 1,
+    *,
+    seq_dropout: float = 0.0,
+    interval_dropout: float = 0.0,
+    rng: np.random.Generator | None = None,
 ) -> tuple[
     NDArray[np.generic],
     NDArray[np.int32],
@@ -59,6 +63,9 @@ def pad_batch(
         intervals_list: List of numpy interval arrays, each (n_i, 3).
         num_devices: Number of devices for batch sharding. Batch size will be
             padded to a multiple of this.
+        seq_dropout: Probability of masking sequence embeddings per position.
+        interval_dropout: Probability of masking interval encodings per position.
+        rng: NumPy random generator for dropout. If None, uses default_rng().
 
     Returns:
         Tuple of numpy arrays (caller transfers to device):
@@ -78,12 +85,26 @@ def pad_batch(
     # Mask: True = masked/padded, starts all True
     mask = np.ones((batch_size, pad_len, 2), dtype=np.bool_)
 
-    # Fill in actual data and unmask valid positions
+    # Create rng if dropout is enabled and not provided
+    if (seq_dropout > 0 or interval_dropout > 0) and rng is None:
+        rng = np.random.default_rng()
+
+    # Fill in actual data and apply dropout masks
     for i, (emb, ivs) in enumerate(zip(embeddings_list, intervals_list)):
         n = emb.shape[0]
         padded_emb[i, :n] = emb
         padded_ivs[i, :n] = ivs
-        mask[i, :n] = False
+
+        # Apply dropout masks (True = masked)
+        if seq_dropout > 0 and rng is not None:
+            mask[i, :n, 0] = rng.random(n) < seq_dropout
+        else:
+            mask[i, :n, 0] = False
+
+        if interval_dropout > 0 and rng is not None:
+            mask[i, :n, 1] = rng.random(n) < interval_dropout
+        else:
+            mask[i, :n, 1] = False
 
     return padded_emb, padded_ivs, mask
 
@@ -134,6 +155,10 @@ def embed_batch(
     intervals_list: Sequence[NDArray[np.generic]],
     shard: jax.NamedSharding | None = None,
     num_devices: int | None = None,
+    *,
+    seq_dropout: float = 0.0,
+    interval_dropout: float = 0.0,
+    rng: np.random.Generator | None = None,
 ) -> Float[Array, "batch output_dim"]:
     """Embed a batch of BED files. Handles padding internally.
 
@@ -144,6 +169,11 @@ def embed_batch(
         model: CModel in inference mode (should have dropout disabled).
         embeddings_list: List of embedding arrays, each (n_i, seq_dim).
         intervals_list: List of interval arrays, each (n_i, 3).
+        shard: Optional sharding for device placement.
+        num_devices: Number of devices for batch sharding.
+        seq_dropout: Probability of masking sequence embeddings per position.
+        interval_dropout: Probability of masking interval encodings per position.
+        rng: NumPy random generator for dropout.
 
     Returns:
         Batch embeddings of shape (batch_size, output_dim).
@@ -154,7 +184,12 @@ def embed_batch(
 
     # Pad to uniform length with device alignment
     padded_emb, padded_ivs, mask = pad_batch(
-        embeddings_list, intervals_list, num_devices
+        embeddings_list,
+        intervals_list,
+        num_devices,
+        seq_dropout=seq_dropout,
+        interval_dropout=interval_dropout,
+        rng=rng,
     )
 
     if shard is None:
@@ -181,6 +216,10 @@ def embed_dataset(
     bed_data: list[BedFileData],
     batch_size: int = 64,
     use_tqdm: bool = False,
+    *,
+    seq_dropout: float = 0.0,
+    interval_dropout: float = 0.0,
+    seed: int | None = None,
 ) -> Float[Array, "n_files output_dim"]:
     """Embed entire dataset efficiently in batches.
 
@@ -190,6 +229,10 @@ def embed_dataset(
         model: CModel (will be put in inference mode).
         bed_data: List of BedFileData objects.
         batch_size: Number of files to process per batch.
+        use_tqdm: Whether to display a progress bar.
+        seq_dropout: Probability of masking sequence embeddings per position.
+        interval_dropout: Probability of masking interval encodings per position.
+        seed: Random seed for dropout reproducibility.
 
     Returns:
         Embeddings for all files, shape (n_files, output_dim).
@@ -198,6 +241,9 @@ def embed_dataset(
 
     mesh = create_device_mesh()
     shard = batch_sharding(mesh)
+
+    # Create rng if dropout is enabled
+    rng = np.random.default_rng(seed) if (seq_dropout > 0 or interval_dropout > 0) else None
 
     all_embeddings = []
     n_files = len(bed_data)
@@ -218,6 +264,9 @@ def embed_dataset(
             embeddings_list,
             intervals_list,
             shard=shard,
+            seq_dropout=seq_dropout,
+            interval_dropout=interval_dropout,
+            rng=rng,
         )
         all_embeddings.append(batch_embeddings)
 
