@@ -57,6 +57,9 @@ class DenseHeatMatrix:
     vmax: float | None = None
     figsize: tuple[float, float] = (12, 10)
     cbar_label: str = "Value"
+    show_colorbar: bool = True
+    cbar_fraction: float = 0.05
+    cbar_pad: float = 0.02
     line_color: str | None = None
     line_style: str = ":"
     line_width: float = 1.5
@@ -158,23 +161,31 @@ class DenseHeatMatrix:
         )
         plot_data = self._reorder_data()
 
+        subplot_mode = fig is not None and ax is not None
         show_row_key = (
-            self.row_config.show_label_key and self.row_config.category_mapping
+            not subplot_mode
+            and self.row_config.show_label_key
+            and self.row_config.category_mapping
         )
         show_col_key = (
-            self.col_config.show_label_key and self.col_config.category_mapping
+            not subplot_mode
+            and self.col_config.show_label_key
+            and self.col_config.category_mapping
         )
 
-        if fig is None or ax is None:
-            if show_row_key or show_col_key:
-                fig = plt.figure(figsize=(self.figsize[0] + 4, self.figsize[1]))
-                ax = fig.add_axes((0.1, 0.1, 0.6, 0.8))
-            else:
-                fig, ax = plt.subplots(figsize=self.figsize)
+        if subplot_mode:
+            assert fig is not None and ax is not None
+        elif show_row_key or show_col_key:
+            # Use GridSpec so the label-key panel doesn't fight with the heatmap
+            key_width = 4.0
+            fig = plt.figure(
+                figsize=(self.figsize[0] + key_width, self.figsize[1]),
+                layout="constrained",
+            )
+            gs = fig.add_gridspec(1, 2, width_ratios=[self.figsize[0], key_width])
+            ax = fig.add_subplot(gs[0])
         else:
-            # When using provided axes, skip label keys (not supported in subplot mode)
-            show_row_key = False
-            show_col_key = False
+            fig, ax = plt.subplots(figsize=self.figsize, layout="constrained")
 
         vmin = self.vmin if self.vmin is not None else float(np.nanmin(self.data))
         vmax = self.vmax if self.vmax is not None else float(np.nanmax(self.data))
@@ -220,13 +231,15 @@ class DenseHeatMatrix:
         if self.title:
             ax.set_title(self.title, fontsize=14, fontweight="bold")
 
-        cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
-        cbar.set_label(self.cbar_label)
+        if self.show_colorbar:
+            cbar = fig.colorbar(
+                im, ax=ax, fraction=self.cbar_fraction, pad=self.cbar_pad
+            )
+            cbar.set_label(self.cbar_label)
 
         if show_row_key or show_col_key:
+            assert fig is not None
             self._add_label_keys(fig, bool(show_row_key), bool(show_col_key))
-        else:
-            plt.tight_layout()
 
         return fig, ax
 
@@ -324,6 +337,9 @@ def plot_dense_heatmap(
     vmin: float | None = None,
     vmax: float | None = None,
     cbar_label: str = "Value",
+    show_colorbar: bool = True,
+    cbar_fraction: float = 0.05,
+    cbar_pad: float = 0.02,
     figsize: tuple[float, float] = (12, 10),
     line_color: str | None = None,
     line_style: str = ":",
@@ -358,6 +374,9 @@ def plot_dense_heatmap(
         vmin=vmin,
         vmax=vmax,
         cbar_label=cbar_label,
+        show_colorbar=show_colorbar,
+        cbar_fraction=cbar_fraction,
+        cbar_pad=cbar_pad,
         figsize=figsize,
         line_color=line_color,
         line_style=line_style,

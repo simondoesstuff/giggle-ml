@@ -7,6 +7,7 @@ import os
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -184,7 +185,7 @@ def parse_score_file(score_path: Pathish) -> tuple[list[str], list[float]]:
                 if line.startswith("#") or not line.strip():
                     continue
                 split = line.strip().split()
-                yield split[0], float(split[-1])
+                yield Path(split[0]).name.split(".")[0], float(split[-1])
 
     # Ensure list types are returned to match type hints
     parsed_tuples = sorted(parse(), key=lambda x: -x[1])
@@ -206,10 +207,12 @@ class _PlotData:
 
 
 def _prepare_plot_data(
-    score_paths: tuple[Pathish, ...], names: tuple[str, ...]
+    score_paths: tuple[Pathish, ...],
+    names: tuple[str, ...],
+    states: list[str] | None = None,
 ) -> list[_PlotData]:
     """Parse score files and prepare data for plotting."""
-    col_labels = chromatin_states
+    col_labels = states if states is not None else chromatin_states
     n_cols = len(col_labels)
     plot_data_list: list[_PlotData] = []
 
@@ -277,11 +280,14 @@ def plot_rme_similarity(
     output_path: Pathish | None = None,
     show: bool = True,
     sigmoid_params: tuple[SigmoidParams, ...] | None = None,
+    states: list[str] | None = None,
+    znorm: bool = False,
+    cmap: str = "RdBu_r",
 ) -> None:
     if len(score_paths) != len(names):
         raise ValueError("Must provide the same number of score paths and names.")
 
-    plot_data_list = _prepare_plot_data(score_paths, names)
+    plot_data_list = _prepare_plot_data(score_paths, names, states=states)
 
     if not plot_data_list:
         print("No valid data to plot.", file=sys.stderr)
@@ -301,7 +307,7 @@ def plot_rme_similarity(
             f"sigmoid_params must have 1 or {n_plots} values, got {len(sigmoid_params)}"
         )
 
-    col_labels = chromatin_states
+    col_labels = states if states is not None else chromatin_states
     cat_order = cell_categories
 
     # Compute figure dimensions
@@ -312,7 +318,13 @@ def plot_rme_similarity(
     fig_height = subplot_height
 
     plt.style.use("dark_background")
-    fig, axes = plt.subplots(1, n_plots, figsize=(fig_width, fig_height), squeeze=False)
+    fig, axes = plt.subplots(
+        1,
+        n_plots,
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+        layout="constrained",
+    )
 
     for idx, pd in enumerate(plot_data_list):
         ax = axes[0, idx]
@@ -327,6 +339,12 @@ def plot_rme_similarity(
             plot_data = pd.data
             title = pd.name
             cbar_label = "Similarity Score"
+
+        if znorm:
+            col_mean = np.nanmean(plot_data, axis=0, keepdims=True)
+            col_std = np.nanstd(plot_data, axis=0, keepdims=True)
+            plot_data = (plot_data - col_mean) / np.where(col_std == 0, 1.0, col_std)
+            cbar_label = f"Z-score ({cbar_label})"
 
         def make_row_cat_fn(
             bed_to_cat: dict[str, str],
@@ -343,17 +361,15 @@ def plot_rme_similarity(
             row_category_fn=make_row_cat_fn(pd.bed_to_category),
             row_category_order=cat_order,
             title=title,
-            cmap="RdBu_r",
+            cmap=cmap,
             line_color="black",
             cbar_label=cbar_label,
             fig=fig,
             ax=ax,
         )
 
-    plt.tight_layout()
-
     if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
         print(f"Saved to {output_path}", file=sys.stderr)
 
     if show:
@@ -408,6 +424,26 @@ def main():
         default=[0.0],
         help="Sigmoid midpoint(s) where output is 0.5. Default: 0.0.",
     )
+    parser.add_argument(
+        "--cmap",
+        default="RdBu_r",
+        help="Matplotlib colormap name (default: RdBu_r).",
+    )
+    parser.add_argument(
+        "--znorm",
+        action="store_true",
+        help="Z-score normalize each chromatin state column across cell types before plotting.",
+    )
+    parser.add_argument(
+        "--states",
+        nargs="+",
+        choices=chromatin_states,
+        metavar="STATE",
+        help=(
+            "Whitelist of chromatin states to include (default: all). "
+            f"Choices: {', '.join(chromatin_states)}"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -447,6 +483,9 @@ def main():
         output_path=args.output,
         show=not args.no_show,
         sigmoid_params=sigmoid_params,
+        states=args.states,
+        znorm=args.znorm,
+        cmap=args.cmap,
     )
 
 
